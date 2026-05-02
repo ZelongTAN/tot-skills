@@ -201,13 +201,24 @@ Configure `.codex-collab/config.json`:
       "cwd": ".",
       "useResume": true,
       "sessionId": "worker-codex-session-id",
+      "model": "gpt-5.4",
+      "reasoningEffort": "xhigh",
       "sandbox": "workspace-write"
     }
   },
   "coordinator": {
-    "sessionId": "main-codex-session-id"
+    "sessionId": "main-codex-session-id",
+    "model": "gpt-5.4",
+    "reasoningEffort": "xhigh"
   }
 }
+```
+
+You can also override these for one live loop:
+
+```bash
+python .codex-collab/collab.py start-worker --worker worker-a --model gpt-5.4 --reasoning-effort xhigh
+python .codex-collab/collab.py run-coordinator --model gpt-5.4 --reasoning-effort xhigh
 ```
 
 Then run:

@@ -17,7 +17,7 @@ from typing import Any
 
 PRODUCT_NAME = "Codex Collab"
 CLI_NAME = "codex-collab"
-RUNNER_VERSION = "0.1.1"
+RUNNER_VERSION = "0.1.2"
 SCHEMA_VERSION = 1
 RUNTIME_DIR = ".codex-collab"
 LEGACY_RUNTIME_DIR = ".codex-collab"
@@ -35,6 +35,7 @@ TASK_STATUSES = [
 ]
 ATTENTION_STATUSES = {"needs-approval", "needs-human", "blocked", "failed"}
 RISK_VALUES = {"low", "medium", "high"}
+REASONING_EFFORT_VALUES = {"minimal", "low", "medium", "high", "xhigh"}
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,79}$")
 LOCK_STALE_SECONDS = 900
 COORDINATOR_NOTIFY_STATUSES = {"review", "failed", "blocked", "needs-human"}
@@ -159,6 +160,26 @@ def run_codex_cli(args: list[str], timeout: int, log_path: Path, prompt: str | N
         return 124
 
 
+def codex_model_args(config: dict[str, Any]) -> list[str]:
+    args: list[str] = []
+    model = str(config.get("model", "")).strip()
+    reasoning_effort = str(config.get("reasoningEffort", "")).strip()
+    if model:
+        args += ["-m", model]
+    if reasoning_effort:
+        args += ["-c", f'model_reasoning_effort="{reasoning_effort}"']
+    return args
+
+
+def merge_runtime_overrides(config: dict[str, Any], model: str = "", reasoning_effort: str = "") -> dict[str, Any]:
+    merged = dict(config)
+    if model:
+        merged["model"] = model
+    if reasoning_effort:
+        merged["reasoningEffort"] = reasoning_effort
+    return merged
+
+
 def find_root(start: Path | None = None) -> Path:
     if start:
         current = start.resolve()
@@ -235,6 +256,7 @@ def default_config(root: Path) -> dict[str, Any]:
         "coordinator": {
             "sessionId": "",
             "model": "",
+            "reasoningEffort": "",
             "pollSeconds": 5,
             "codexTimeoutSeconds": 1800,
             "maxAttempts": 3,
@@ -245,6 +267,7 @@ def default_config(root: Path) -> dict[str, Any]:
             "worker-a": {
                 "cwd": str(root.parent),
                 "model": "",
+                "reasoningEffort": "",
                 "useResume": False,
                 "sessionId": "",
                 "pollSeconds": 5,
@@ -705,8 +728,7 @@ def run_coordinator_codex(root: Path, event: dict[str, Any], coordinator: dict[s
     output_last = log_dir / f"{slugify(event['id'])}-last-message.md"
     prompt = coordinator_prompt(root, event)
     cmd = ["exec", "resume"]
-    if coordinator.get("model"):
-        cmd += ["-m", str(coordinator["model"])]
+    cmd += codex_model_args(coordinator)
     cmd += ["-o", str(output_last), "--skip-git-repo-check", session_id, "-"]
     log_path = log_dir / f"{slugify(event['id'])}.log"
     return run_codex_cli(cmd, timeout, log_path, prompt=prompt), log_path
@@ -797,6 +819,23 @@ def validate_data(root: Path, data: dict[str, Any], workers: dict[str, Any]) -> 
         handoff = task.get("handoffPath")
         if handoff and not (root / handoff).exists():
             issues.append({"level": "warning", "message": f"{task_id}: handoffPath does not exist: {handoff}."})
+    return issues
+
+
+def validate_codex_runtime_config(label: str, config: dict[str, Any]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    model = config.get("model", "")
+    if model is not None and not isinstance(model, str):
+        issues.append({"level": "error", "message": f"{label}.model must be a string."})
+    reasoning_effort = config.get("reasoningEffort", "")
+    if reasoning_effort is None:
+        return issues
+    if not isinstance(reasoning_effort, str):
+        issues.append({"level": "error", "message": f"{label}.reasoningEffort must be a string."})
+        return issues
+    if reasoning_effort and reasoning_effort not in REASONING_EFFORT_VALUES:
+        allowed = ", ".join(sorted(REASONING_EFFORT_VALUES))
+        issues.append({"level": "warning", "message": f"{label}.reasoningEffort is '{reasoning_effort}'. Common values: {allowed}."})
     return issues
 
 
@@ -930,6 +969,9 @@ def doctor_issues(root: Path, live: bool) -> list[dict[str, str]]:
         data = load_tasks(root)
         workers = get_workers(root)
         coordinator = get_coordinator(root)
+        issues.extend(validate_codex_runtime_config("coordinator", coordinator))
+        for worker_name, worker_cfg in workers.items():
+            issues.extend(validate_codex_runtime_config(f"worker {worker_name}", worker_cfg))
         issues.extend(validate_data(root, data, workers))
         issues.extend(validate_queue(root, load_queue(root), data, coordinator))
     except json.JSONDecodeError as exc:
@@ -952,6 +994,9 @@ def doctor_issues(root: Path, live: bool) -> list[dict[str, str]]:
     else:
         level = "warning" if not live else "error"
         issues.append({"level": level, "message": "coordinator.sessionId is empty; live run-coordinator cannot resume the main session."})
+    coordinator_model = str(coordinator.get("model", "")).strip() or "default"
+    coordinator_effort = str(coordinator.get("reasoningEffort", "")).strip() or "default"
+    issues.append({"level": "ok", "message": f"coordinator model/reasoning: {coordinator_model}/{coordinator_effort}."})
 
     if not workers:
         issues.append({"level": "error", "message": "No workers are configured in config.json."})
@@ -964,6 +1009,9 @@ def doctor_issues(root: Path, live: bool) -> list[dict[str, str]]:
         issues.append({"level": level, "message": f"worker {worker} cwd: {cwd} ({'found' if cwd.exists() else 'missing'})."})
         if cfg.get("useResume") and not str(cfg.get("sessionId", "")).strip():
             issues.append({"level": "error", "message": f"worker {worker} uses resume but sessionId is empty."})
+        worker_model = str(cfg.get("model", "")).strip() or "default"
+        worker_effort = str(cfg.get("reasoningEffort", "")).strip() or "default"
+        issues.append({"level": "ok", "message": f"worker {worker} model/reasoning: {worker_model}/{worker_effort}."})
     return issues
 
 
@@ -1311,12 +1359,10 @@ Do not revert unrelated changes made by other workers or the user.
     cmd = ["exec"]
     if worker_cfg.get("useResume") and worker_cfg.get("sessionId"):
         cmd += ["resume"]
-        if worker_cfg.get("model"):
-            cmd += ["-m", worker_cfg["model"]]
+        cmd += codex_model_args(worker_cfg)
         cmd += ["-o", str(output_last), "--skip-git-repo-check", worker_cfg["sessionId"], "-"]
     else:
-        if worker_cfg.get("model"):
-            cmd += ["-m", worker_cfg["model"]]
+        cmd += codex_model_args(worker_cfg)
         if worker_cfg.get("sandbox"):
             cmd += ["-s", worker_cfg["sandbox"]]
         cmd += ["-C", cwd, "-o", str(output_last), "--skip-git-repo-check", "-"]
@@ -1357,6 +1403,7 @@ def command_start_worker(args) -> None:
     worker_cfg = config.get("workers", {}).get(args.worker, {})
     if not worker_cfg:
         raise SystemExit(f"Worker is not defined in config.json: {args.worker}")
+    worker_cfg = merge_runtime_overrides(worker_cfg, args.model, args.reasoning_effort)
     poll = args.poll_seconds or int(worker_cfg.get("pollSeconds", 5))
     timeout = args.codex_timeout_seconds or int(worker_cfg.get("codexTimeoutSeconds", 3600))
     stale_minutes = args.stale_running_minutes or int(worker_cfg.get("staleRunningMinutes", 240))
@@ -1424,6 +1471,7 @@ def command_run_coordinator(args) -> None:
     coordinator = get_coordinator(root)
     if not args.dry_run and not str(coordinator.get("sessionId", "")).strip():
         raise SystemExit("config.json coordinator.sessionId is required for live run-coordinator. Use --dry-run to test queue flow.")
+    coordinator = merge_runtime_overrides(coordinator, args.model, args.reasoning_effort)
     poll = args.poll_seconds or int(coordinator.get("pollSeconds", 5) or 5)
     timeout = args.codex_timeout_seconds or int(coordinator.get("codexTimeoutSeconds", 1800) or 1800)
     lease = args.lease_minutes or int(coordinator.get("leaseMinutes", 60) or 60)
@@ -1735,6 +1783,8 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--poll-seconds", type=int, default=0)
     start.add_argument("--codex-timeout-seconds", type=int, default=0)
     start.add_argument("--stale-running-minutes", type=int, default=0)
+    start.add_argument("--model", default="", help="Override this worker's Codex model for this run")
+    start.add_argument("--reasoning-effort", choices=sorted(REASONING_EFFORT_VALUES), default="", help="Override this worker's Codex reasoning effort for this run")
     start.set_defaults(func=command_start_worker)
 
     stop = sub.add_parser("stop-worker")
@@ -1750,6 +1800,8 @@ def build_parser() -> argparse.ArgumentParser:
     coordinator.add_argument("--poll-seconds", type=int, default=0)
     coordinator.add_argument("--codex-timeout-seconds", type=int, default=0)
     coordinator.add_argument("--lease-minutes", type=int, default=0)
+    coordinator.add_argument("--model", default="", help="Override the coordinator Codex model for this run")
+    coordinator.add_argument("--reasoning-effort", choices=sorted(REASONING_EFFORT_VALUES), default="", help="Override the coordinator Codex reasoning effort for this run")
     coordinator.set_defaults(func=command_run_coordinator)
 
     status = sub.add_parser("status")

@@ -101,11 +101,15 @@ Minimum shape:
       "cwd": ".",
       "useResume": true,
       "sessionId": "worker-codex-session-id",
+      "model": "gpt-5.4",
+      "reasoningEffort": "xhigh",
       "sandbox": "workspace-write"
     }
   },
   "coordinator": {
-    "sessionId": "main-coordinator-session-id"
+    "sessionId": "main-coordinator-session-id",
+    "model": "gpt-5.4",
+    "reasoningEffort": "xhigh"
   }
 }
 ```
@@ -117,6 +121,8 @@ python .codex-collab/collab.py doctor --live
 ```
 
 Live Codex launch is cross-platform: the runner resolves `codex` with `shutil.which`, routes Windows `.cmd` / `.bat` shims through `cmd.exe`, sends prompts through stdin, and decodes captured output as UTF-8 with replacement.
+
+`model` and `reasoningEffort` are optional. The coordinator can also override them for a single loop with `--model gpt-5.4 --reasoning-effort xhigh`.
 
 Run live worker/coordinator loops:
 

@@ -268,6 +268,7 @@ Not included:
   "coordinator": {
     "sessionId": "",
     "model": "",
+    "reasoningEffort": "",
     "pollSeconds": 5,
     "codexTimeoutSeconds": 1800,
     "maxAttempts": 3,

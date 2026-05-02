@@ -203,13 +203,24 @@ python .codex-collab/collab.py status
       "cwd": ".",
       "useResume": true,
       "sessionId": "worker-codex-session-id",
+      "model": "gpt-5.4",
+      "reasoningEffort": "xhigh",
       "sandbox": "workspace-write"
     }
   },
   "coordinator": {
-    "sessionId": "main-codex-session-id"
+    "sessionId": "main-codex-session-id",
+    "model": "gpt-5.4",
+    "reasoningEffort": "xhigh"
   }
 }
+```
+
+`model` 和 `reasoningEffort` 都是可选项；不写时使用本机 Codex CLI 默认设置。也可以只对某一次 live loop 临时覆盖：
+
+```bash
+python .codex-collab/collab.py start-worker --worker worker-a --model gpt-5.4 --reasoning-effort xhigh
+python .codex-collab/collab.py run-coordinator --model gpt-5.4 --reasoning-effort xhigh
 ```
 
 然后运行：

@@ -1,6 +1,6 @@
 # Codex Collab Usage
 
-Version: `0.1.1`
+Version: `0.1.2`
 
 Codex-first local runner for a main Codex coordinator and one or more persistent Codex worker sessions.
 
@@ -96,14 +96,20 @@ Configure `.codex-collab/config.json`:
       "cwd": ".",
       "useResume": true,
       "sessionId": "worker-codex-session-id",
+      "model": "gpt-5.4",
+      "reasoningEffort": "xhigh",
       "sandbox": "workspace-write"
     }
   },
   "coordinator": {
-    "sessionId": "main-coordinator-session-id"
+    "sessionId": "main-coordinator-session-id",
+    "model": "gpt-5.4",
+    "reasoningEffort": "xhigh"
   }
 }
 ```
+
+`model` and `reasoningEffort` are optional. If omitted, Codex uses the user's normal CLI defaults. Common reasoning effort values are `minimal`, `low`, `medium`, `high`, and `xhigh`.
 
 Live worker:
 
@@ -111,10 +117,22 @@ Live worker:
 python .codex-collab/collab.py start-worker --worker worker-a
 ```
 
+Override model and reasoning effort for one worker loop:
+
+```bash
+python .codex-collab/collab.py start-worker --worker worker-a --model gpt-5.4 --reasoning-effort xhigh
+```
+
 Live coordinator:
 
 ```bash
 python .codex-collab/collab.py run-coordinator
+```
+
+Override model and reasoning effort for one coordinator loop:
+
+```bash
+python .codex-collab/collab.py run-coordinator --model gpt-5.4 --reasoning-effort xhigh
 ```
 
 Graceful stop:
