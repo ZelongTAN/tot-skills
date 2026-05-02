@@ -2,6 +2,8 @@
 
 中文 · [English](README.en.md)
 
+![Codex Collab before and after system diagram](assets/codex-collab-system-diagram.png)
+
 > 人看的产品页。Agent 运行时入口在 [SKILL.md](SKILL.md)，深入设计在 [references/](references/)。
 
 #### 🧭 给一个主 Codex 装上“调度员能力”

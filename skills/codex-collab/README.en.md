@@ -2,6 +2,8 @@
 
 [中文](README.md) · English
 
+![Codex Collab before and after system diagram](assets/codex-collab-system-diagram.png)
+
 > Human-facing product page. The Agent runtime entry is [SKILL.md](SKILL.md), and deeper design notes live in [references/](references/).
 
 #### 🧭 Give one main Codex a coordinator skill
