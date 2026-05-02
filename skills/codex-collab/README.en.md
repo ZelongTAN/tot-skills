@@ -39,7 +39,6 @@ The current implementation and validation are Codex-first. Other Agents can port
 - 🔔 **Explicit callback queue**: worker completion writes `coordinator_queue.json`; the main Codex is woken in order.
 - 📊 **Dashboard view**: `dashboard.md` is rendered from JSON for humans and Codex to scan.
 - 🧯 **Long-running recovery**: locks, heartbeat, stale recovery, and `repair-queue` handle crashes and missed wakeups.
-- 🧪 **Dry-run first**: test tasks, workers, handoffs, and queues without launching real Codex work.
 
 ---
 

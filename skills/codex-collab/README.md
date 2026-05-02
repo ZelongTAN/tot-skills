@@ -39,7 +39,6 @@ Codex Collab 的切入点不是让人手动操作一个“多 Agent 框架”，
 - 🔔 **显式回调队列**：worker 完成后写入 `coordinator_queue.json`，主 Codex 被按队列唤醒。
 - 📊 **Dashboard 视图**：`dashboard.md` 从 JSON 渲染，方便人和 Codex 快速扫描。
 - 🧯 **长时间运行恢复**：锁、heartbeat、stale recovery、`repair-queue` 用来处理崩溃和漏通知。
-- 🧪 **Dry-run 先验证**：不启动真实 Codex，也能先跑通任务、worker、handoff、queue。
 
 ---
 
