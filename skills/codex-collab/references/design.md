@@ -244,7 +244,8 @@ Included:
 - enqueue from `finish_task`
 - idempotent `repair-queue`
 - `run-coordinator --once`
-- `run-coordinator --dry-run`
+- read-only `start-worker --dry-run` and `run-coordinator --dry-run`
+- mutating local rehearsal through `start-worker --exercise-flow` and `run-coordinator --exercise-flow`
 - serial event claim
 - retry counter and max attempts
 - lease timeout for stale `running` events
@@ -278,7 +279,27 @@ Not included:
 }
 ```
 
-If `sessionId` is empty, `run-coordinator` refuses live mode and explains how to configure it. `--dry-run` still works.
+If `sessionId` is empty, `run-coordinator` refuses live mode and explains how to configure it. `--dry-run` still works because it is read-only. `--exercise-flow` also works without a session id because it rehearses queue state locally without resuming Codex.
+
+## Preview And Rehearsal Modes
+
+`--dry-run` is deliberately non-mutating:
+
+- worker dry-run peeks the next eligible `pending` task for that worker
+- coordinator dry-run peeks the next eligible `pending` or `retry` queue event
+- no task is claimed
+- no queue event is claimed
+- no run directory, handoff, heartbeat, or state file is written
+- no `repair-queue` or stale recovery is performed implicitly
+
+`--exercise-flow` is explicitly mutating:
+
+- worker exercise-flow uses the same task claim path as live mode
+- it writes a fake handoff and run log instead of invoking Codex
+- `finish_task` moves the task to coordinator attention and enqueues the queue event
+- coordinator exercise-flow claims a queue event and marks it `delivered` or `resolved` without resuming Codex
+
+This split keeps the safe command safe while preserving the old end-to-end local rehearsal behavior behind a name that admits it changes state.
 
 ## Queue Validation
 

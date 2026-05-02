@@ -1,6 +1,6 @@
 # Codex Collab Usage
 
-Version: `0.1.2`
+Version: `0.1.3`
 
 Codex-first local runner for a main Codex coordinator and one or more persistent Codex worker sessions.
 
@@ -66,9 +66,15 @@ python .codex-collab/collab.py validate
 python .codex-collab/collab.py dashboard
 python .codex-collab/collab.py start-worker --worker worker-a --dry-run --once
 python .codex-collab/collab.py run-coordinator --dry-run --once
+python .codex-collab/collab.py start-worker --worker worker-a --exercise-flow --once
+python .codex-collab/collab.py run-coordinator --exercise-flow --once
 python .codex-collab/collab.py review
 python .codex-collab/collab.py dashboard
 ```
+
+`--dry-run` is read-only. It previews the next eligible task or coordinator queue event and does not write `tasks.json`, `coordinator_queue.json`, `runs/`, or `state/`.
+
+`--exercise-flow` is the mutating local rehearsal mode. It claims a task, writes fake run artifacts, enqueues coordinator attention, and processes the queue without invoking real Codex. Use it on disposable smoke tasks, not real work.
 
 Check the installed version:
 
@@ -182,10 +188,16 @@ resolved    task no longer needs coordinator attention
 failed      delivery failed too many times
 ```
 
-Test the queue without calling Codex:
+Preview the next queue event without changing it:
 
 ```bash
 python .codex-collab/collab.py run-coordinator --dry-run --once
+```
+
+Exercise the queue state machine without calling Codex:
+
+```bash
+python .codex-collab/collab.py run-coordinator --exercise-flow --once
 ```
 
 Repair missing queue events from `tasks.json`:

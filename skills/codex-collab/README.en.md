@@ -178,7 +178,11 @@ It creates:
   state/                   locks, heartbeats, stop files
 ```
 
-## Dry-run
+## Dry-run / Exercise-flow
+
+`--dry-run` is a read-only preview. It only shows which task would be claimed or which queue event would be processed; it does not modify `tasks.json`, `coordinator_queue.json`, `runs/`, or `state/`.
+
+If you want to rehearse the whole local state flow without launching real Codex, use `--exercise-flow` explicitly on a disposable smoke task.
 
 ```bash
 cd /path/to/project
@@ -187,6 +191,8 @@ python .codex-collab/collab.py validate
 python .codex-collab/collab.py new-task --owner worker-a --title "Smoke test" --goal "Verify collaboration flow"
 python .codex-collab/collab.py start-worker --worker worker-a --dry-run --once
 python .codex-collab/collab.py run-coordinator --dry-run --once
+python .codex-collab/collab.py start-worker --worker worker-a --exercise-flow --once
+python .codex-collab/collab.py run-coordinator --exercise-flow --once
 python .codex-collab/collab.py status
 ```
 

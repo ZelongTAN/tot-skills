@@ -17,7 +17,7 @@ from typing import Any
 
 PRODUCT_NAME = "Codex Collab"
 CLI_NAME = "codex-collab"
-RUNNER_VERSION = "0.1.2"
+RUNNER_VERSION = "0.1.3"
 SCHEMA_VERSION = 1
 RUNTIME_DIR = ".codex-collab"
 LEGACY_RUNTIME_DIR = ".codex-collab"
@@ -208,6 +208,10 @@ def write_json(path: Path, value: Any) -> None:
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def clone_json(value: Any) -> Any:
+    return json.loads(json.dumps(value))
 
 
 @contextmanager
@@ -669,6 +673,27 @@ def claim_coordinator_event(root: Path, coordinator: dict[str, Any]) -> dict[str
     return None
 
 
+def peek_coordinator_event(root: Path, coordinator: dict[str, Any]) -> dict[str, Any] | None:
+    max_attempts = int(coordinator.get("maxAttempts", 3) or 3)
+    configured_statuses = coordinator.get("notifyStatuses", sorted(COORDINATOR_NOTIFY_STATUSES))
+    notify_statuses = {str(status) for status in configured_statuses if str(status) in TASK_STATUSES} if isinstance(configured_statuses, list) else set(COORDINATOR_NOTIFY_STATUSES)
+    if not notify_statuses:
+        notify_statuses = set(COORDINATOR_NOTIFY_STATUSES)
+    queue = load_queue(root)
+    data = load_tasks(root)
+    tasks_by_id = {task.get("id"): task for task in data.get("tasks", []) if isinstance(task, dict)}
+    for event in queue.get("events", []):
+        if event.get("state") not in {"pending", "retry"}:
+            continue
+        if int(event.get("attempts", 0) or 0) >= max_attempts:
+            continue
+        task = tasks_by_id.get(event.get("taskId"))
+        if not task or not event_matches_current_task_attention(event, task, notify_statuses):
+            continue
+        return clone_json(event)
+    return None
+
+
 def update_queue_event(root: Path, event_id: str, state: str, **fields: Any) -> None:
     with queue_lock(root):
         queue = load_queue(root)
@@ -687,6 +712,26 @@ def event_still_needs_coordinator(root: Path, event: dict[str, Any]) -> bool:
     data = load_tasks(root)
     task = find_task(data, str(event.get("taskId", "")))
     return bool(task and task_needs_coordinator(task, coordinator_notify_statuses(root)))
+
+
+def print_task_preview(task: dict[str, Any] | None, worker: str) -> None:
+    if not task:
+        print(f"Dry-run preview: worker {worker!r} has no eligible pending task.")
+        return
+    print(f"Dry-run preview: worker {worker!r} would claim task {task.get('id')}.")
+    print(f"  title: {task.get('title', '')}")
+    print(f"  risk/status: {task.get('risk', '')}/{task.get('status', '')}")
+    print("  no files, tasks, runs, queue events, or worker state were changed.")
+
+
+def print_coordinator_event_preview(event: dict[str, Any] | None) -> None:
+    if not event:
+        print("Dry-run preview: no eligible coordinator queue event is ready.")
+        return
+    print(f"Dry-run preview: coordinator would process event {event.get('id')}.")
+    print(f"  task/status: {event.get('taskId', '')}/{event.get('status', '')}")
+    print(f"  state/attempts: {event.get('state', '')}/{event.get('attempts', 0)}")
+    print("  no queue events, tasks, runs, or coordinator state were changed.")
 
 
 def coordinator_prompt(root: Path, event: dict[str, Any]) -> str:
@@ -722,7 +767,7 @@ Do not treat this prompt as proof that the task is resolved. The queue runner wi
 def run_coordinator_codex(root: Path, event: dict[str, Any], coordinator: dict[str, Any], timeout: int) -> tuple[int, Path]:
     session_id = str(coordinator.get("sessionId", "")).strip()
     if not session_id:
-        raise SystemExit("config.json coordinator.sessionId is required for live run-coordinator. Use --dry-run to test queue flow.")
+        raise SystemExit("config.json coordinator.sessionId is required for live run-coordinator. Use --dry-run for read-only preview or --exercise-flow for local queue rehearsal.")
     log_dir = root / "state" / "coordinator-runs"
     log_dir.mkdir(parents=True, exist_ok=True)
     output_last = log_dir / f"{slugify(event['id'])}-last-message.md"
@@ -734,8 +779,8 @@ def run_coordinator_codex(root: Path, event: dict[str, Any], coordinator: dict[s
     return run_codex_cli(cmd, timeout, log_path, prompt=prompt), log_path
 
 
-def process_coordinator_event(root: Path, event: dict[str, Any], coordinator: dict[str, Any], dry_run: bool, timeout: int) -> str:
-    if dry_run:
+def process_coordinator_event(root: Path, event: dict[str, Any], coordinator: dict[str, Any], exercise_flow: bool, timeout: int) -> str:
+    if exercise_flow:
         state = "delivered" if event_still_needs_coordinator(root, event) else "resolved"
         update_queue_event(
             root,
@@ -743,8 +788,8 @@ def process_coordinator_event(root: Path, event: dict[str, Any], coordinator: di
             state,
             deliveredAt=iso_now(),
             lastError="",
-            dryRun=True,
-            resolution="Dry-run did not invoke coordinator Codex." if state == "delivered" else "Task no longer needs coordinator attention.",
+            exerciseFlow=True,
+            resolution="Exercise-flow did not invoke coordinator Codex." if state == "delivered" else "Task no longer needs coordinator attention.",
         )
         return state
     exit_code, log_path = run_coordinator_codex(root, event, coordinator, timeout)
@@ -1287,6 +1332,19 @@ def claim_next_task(root: Path, worker: str) -> tuple[dict[str, Any], Path] | tu
     return snapshot, run_dir
 
 
+def peek_next_task(root: Path, worker: str) -> dict[str, Any] | None:
+    data = load_tasks(root)
+    candidates = [
+        task for task in data.get("tasks", [])
+        if task.get("owner") == worker and task.get("status") == "pending"
+        and task_is_approved_for_run(task)
+    ]
+    candidates.sort(key=lambda task: str(task.get("createdAt", "")))
+    if not candidates:
+        return None
+    return clone_json(candidates[0])
+
+
 def infer_completion_status(exit_code: int, handoff: Path) -> str:
     if exit_code != 0:
         return "failed"
@@ -1372,26 +1430,26 @@ Do not revert unrelated changes made by other workers or the user.
     return exit_code
 
 
-def run_task(root: Path, worker: str, task: dict[str, Any], run_dir: Path, worker_cfg: dict[str, Any], dry_run: bool, timeout: int) -> str:
+def run_task(root: Path, worker: str, task: dict[str, Any], run_dir: Path, worker_cfg: dict[str, Any], exercise_flow: bool, timeout: int) -> str:
     task_id = task["id"]
     run_id = task["currentRunId"]
-    write_state(root, worker, "dry-run" if dry_run else "live", "running", task_id, run_id)
-    if dry_run:
+    write_state(root, worker, "exercise-flow" if exercise_flow else "live", "running", task_id, run_id)
+    if exercise_flow:
         (run_dir / "handoff.md").write_text(
             render_handoff(
                 task_id,
                 "done",
-                f"Dry-run completed. Worker {worker} claimed the JSON task without invoking Codex.",
-                validation=f"Dry-run task transition succeeded. Timeout setting: {timeout} seconds.",
+                f"Exercise-flow completed. Worker {worker} claimed the JSON task without invoking Codex.",
+                validation=f"Exercise-flow task transition succeeded. Timeout setting: {timeout} seconds.",
             ),
             encoding="utf-8",
         )
-        (run_dir / "run.log").write_text(f"Dry-run completed for {task_id} by {worker}.\n", encoding="utf-8")
+        (run_dir / "run.log").write_text(f"Exercise-flow completed for {task_id} by {worker}.\n", encoding="utf-8")
         exit_code = 0
     else:
         exit_code = run_codex(root, task, run_dir, worker, worker_cfg, timeout)
     status = finish_task(root, task_id, run_id, exit_code, run_dir / "handoff.md", run_dir / "run.log")
-    write_state(root, worker, "dry-run" if dry_run else "live", "idle")
+    write_state(root, worker, "exercise-flow" if exercise_flow else "live", "idle")
     return status
 
 
@@ -1399,6 +1457,8 @@ def command_start_worker(args) -> None:
     root = find_root(Path(args.root).resolve() if args.root else None)
     ensure_layout(root)
     require_valid(root)
+    if args.dry_run and args.exercise_flow:
+        raise SystemExit("--dry-run is read-only; --exercise-flow mutates state. Choose one.")
     config = load_json(root / "config.json", {})
     worker_cfg = config.get("workers", {}).get(args.worker, {})
     if not worker_cfg:
@@ -1407,7 +1467,10 @@ def command_start_worker(args) -> None:
     poll = args.poll_seconds or int(worker_cfg.get("pollSeconds", 5))
     timeout = args.codex_timeout_seconds or int(worker_cfg.get("codexTimeoutSeconds", 3600))
     stale_minutes = args.stale_running_minutes or int(worker_cfg.get("staleRunningMinutes", 240))
-    mode = "dry-run" if args.dry_run else "live"
+    if args.dry_run:
+        print_task_preview(peek_next_task(root, args.worker), args.worker)
+        return
+    mode = "exercise-flow" if args.exercise_flow else "live"
     stop_file = root / "state" / f"stop-{args.worker}"
     print(f"Worker {args.worker!r} watching tasks.json (mode={mode})")
     while True:
@@ -1426,7 +1489,7 @@ def command_start_worker(args) -> None:
             continue
         print(f"Claimed task: {task['id']}")
         try:
-            status = run_task(root, args.worker, task, run_dir, worker_cfg, args.dry_run, timeout)
+            status = run_task(root, args.worker, task, run_dir, worker_cfg, args.exercise_flow, timeout)
             print(f"Finished task: {task['id']} -> {status}")
         except Exception as exc:
             (run_dir / "run.log").write_text(str(exc) + "\n", encoding="utf-8")
@@ -1468,15 +1531,21 @@ def command_run_coordinator(args) -> None:
     root = find_root(Path(args.root).resolve() if args.root else None)
     ensure_layout(root)
     require_valid(root)
+    if args.dry_run and args.exercise_flow:
+        raise SystemExit("--dry-run is read-only; --exercise-flow mutates state. Choose one.")
     coordinator = get_coordinator(root)
-    if not args.dry_run and not str(coordinator.get("sessionId", "")).strip():
-        raise SystemExit("config.json coordinator.sessionId is required for live run-coordinator. Use --dry-run to test queue flow.")
+    if not args.dry_run and not args.exercise_flow and not str(coordinator.get("sessionId", "")).strip():
+        raise SystemExit("config.json coordinator.sessionId is required for live run-coordinator. Use --dry-run for read-only preview or --exercise-flow for local queue rehearsal.")
     coordinator = merge_runtime_overrides(coordinator, args.model, args.reasoning_effort)
+    if args.dry_run:
+        print_coordinator_event_preview(peek_coordinator_event(root, coordinator))
+        return
     poll = args.poll_seconds or int(coordinator.get("pollSeconds", 5) or 5)
     timeout = args.codex_timeout_seconds or int(coordinator.get("codexTimeoutSeconds", 1800) or 1800)
     lease = args.lease_minutes or int(coordinator.get("leaseMinutes", 60) or 60)
     stop_file = root / "state" / "stop-coordinator"
-    print(f"Coordinator runner watching coordinator_queue.json (dry-run={args.dry_run})")
+    mode = "exercise-flow" if args.exercise_flow else "live"
+    print(f"Coordinator runner watching coordinator_queue.json (mode={mode})")
     while True:
         if stop_file.exists():
             stop_file.unlink(missing_ok=True)
@@ -1492,7 +1561,7 @@ def command_run_coordinator(args) -> None:
             time.sleep(poll)
             continue
         print(f"Claimed coordinator event: {event['id']}")
-        state = process_coordinator_event(root, event, coordinator, args.dry_run, timeout)
+        state = process_coordinator_event(root, event, coordinator, args.exercise_flow, timeout)
         print(f"Finished coordinator event: {event['id']} -> {state}")
         if args.once:
             break
@@ -1778,7 +1847,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = sub.add_parser("start-worker")
     start.add_argument("--worker", required=True)
-    start.add_argument("--dry-run", action="store_true")
+    start.add_argument("--dry-run", action="store_true", help="Read-only preview of the next eligible task; does not claim or write state")
+    start.add_argument("--exercise-flow", action="store_true", help="Mutating local rehearsal: claim a task, write fake run artifacts, and enqueue coordinator review without invoking Codex")
     start.add_argument("--once", action="store_true")
     start.add_argument("--poll-seconds", type=int, default=0)
     start.add_argument("--codex-timeout-seconds", type=int, default=0)
@@ -1795,7 +1865,8 @@ def build_parser() -> argparse.ArgumentParser:
     repair.set_defaults(func=command_repair_queue)
 
     coordinator = sub.add_parser("run-coordinator")
-    coordinator.add_argument("--dry-run", action="store_true")
+    coordinator.add_argument("--dry-run", action="store_true", help="Read-only preview of the next eligible queue event; does not claim or update it")
+    coordinator.add_argument("--exercise-flow", action="store_true", help="Mutating local rehearsal: claim and resolve/deliver a queue event without resuming Codex")
     coordinator.add_argument("--once", action="store_true")
     coordinator.add_argument("--poll-seconds", type=int, default=0)
     coordinator.add_argument("--codex-timeout-seconds", type=int, default=0)

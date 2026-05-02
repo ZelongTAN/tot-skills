@@ -60,7 +60,7 @@ When the user gives a complex task:
 2. Break the goal into small, low-coupling worker tasks.
 3. Keep code-changing workers in separate git worktrees when possible.
 4. Create tasks with clear owners, goals, and review expectations.
-5. Run dry-run commands before live worker/coordinator runs.
+5. Run read-only dry-run previews before live worker/coordinator runs.
 6. Review handoffs before accepting, retrying, or asking the user.
 7. Regenerate the dashboard after meaningful state changes.
 
@@ -70,16 +70,23 @@ Create a worker task:
 python .codex-collab/collab.py new-task --owner worker-a --title "Task title" --goal "Concrete outcome"
 ```
 
-Dry-run one worker:
+Preview one worker without mutating state:
 
 ```bash
 python .codex-collab/collab.py start-worker --worker worker-a --dry-run --once
 ```
 
-Dry-run one coordinator queue pass:
+Preview one coordinator queue pass without mutating state:
 
 ```bash
 python .codex-collab/collab.py run-coordinator --dry-run --once
+```
+
+Exercise the local state flow without invoking real Codex:
+
+```bash
+python .codex-collab/collab.py start-worker --worker worker-a --exercise-flow --once
+python .codex-collab/collab.py run-coordinator --exercise-flow --once
 ```
 
 Review handoffs:

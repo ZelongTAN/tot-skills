@@ -180,7 +180,11 @@ python skills/codex-collab/scripts/collab.py install --target /path/to/project -
   state/                   locks, heartbeats, stop files
 ```
 
-## Dry-run
+## Dry-run / Exercise-flow
+
+`--dry-run` 是只读预览：它只告诉你下一步会领取哪个 task、会处理哪个 queue event，不会改 `tasks.json`、`coordinator_queue.json`、`runs/` 或 `state/`。
+
+如果你想在不启动真实 Codex 的情况下完整演练“领取任务 -> 写 handoff -> 入队 -> coordinator 消费队列”的状态流，请只在一次性 smoke task 上显式使用 `--exercise-flow`。
 
 ```bash
 cd /path/to/project
@@ -189,6 +193,8 @@ python .codex-collab/collab.py validate
 python .codex-collab/collab.py new-task --owner worker-a --title "Smoke test" --goal "Verify collaboration flow"
 python .codex-collab/collab.py start-worker --worker worker-a --dry-run --once
 python .codex-collab/collab.py run-coordinator --dry-run --once
+python .codex-collab/collab.py start-worker --worker worker-a --exercise-flow --once
+python .codex-collab/collab.py run-coordinator --exercise-flow --once
 python .codex-collab/collab.py status
 ```
 
