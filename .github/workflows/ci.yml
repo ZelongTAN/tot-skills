@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile Codex Collab runner
+        run: python -m py_compile skills/codex-collab/scripts/collab.py
+      - name: Smoke Codex Collab
+        run: |
+          python skills/codex-collab/scripts/collab.py install --target /tmp/codex-collab-smoke --dashboard
+          python /tmp/codex-collab-smoke/.codex-collab/collab.py doctor
+          python /tmp/codex-collab-smoke/.codex-collab/collab.py validate
+          python /tmp/codex-collab-smoke/.codex-collab/collab.py new-task --owner worker-a --title "Smoke test" --goal "Verify dry-run"
+          python /tmp/codex-collab-smoke/.codex-collab/collab.py start-worker --worker worker-a --dry-run --once
+          python /tmp/codex-collab-smoke/.codex-collab/collab.py run-coordinator --dry-run --once
+          python /tmp/codex-collab-smoke/.codex-collab/collab.py validate

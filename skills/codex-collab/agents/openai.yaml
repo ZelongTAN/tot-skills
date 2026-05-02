@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Collab"
+  short_description: "Let one Codex coordinate persistent worker sessions."
+  default_prompt: "Use $codex-collab to set up a workspace where the main Codex decomposes complex work, dispatches worker Codex sessions, maintains a dashboard, and reviews handoffs."
