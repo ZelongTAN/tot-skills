@@ -6,7 +6,9 @@ Thanks for improving ToT Skills.
 
 - Put each skill under `skills/<skill-name>/`.
 - Keep each skill self-contained with a required `SKILL.md`.
-- Keep user-facing collection docs in the repository root.
+- Keep repository-level collection docs in the repository root.
+- Use a skill-level `README.md` only when the skill needs a human-facing product page.
+- Keep `SKILL.md` concise and action-oriented because it is loaded by Agents at runtime.
 - Keep detailed operational notes in a skill's `references/` directory.
 - Do not commit local runtime folders, session IDs, logs, or generated state.
 

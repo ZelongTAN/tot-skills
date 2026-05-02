@@ -2,65 +2,45 @@
 
 中文 · [English](README.en.md)
 
-#### 🧰 给 Agent 用的实用 skill 集合
+## 🧰 给通用型 Agent 用的实用 skill 集合
 
-ToT Skills 是一组面向真实工作的 Agent skills。每个 skill 都应该能被 Agent 直接安装、直接使用，并尽量把复杂流程变成可复用的本地工作方式。
+ToT Skills 是一组面向真实工作的 Agent skills。它的目标是把可复用的协作流程、工具和约束，整理成通用型 Agent 可以学习、安装和操作的本地能力。
 
-这里的重点不是让人背命令，而是让 Agent 变得更会干活：你把安装链接丢给 Codex、Claude Code、OpenCode、OpenClaw 等支持 skill 的 Agent，它就能把对应 skill 装进自己的工作流里。
+当前实现和验证优先围绕 Codex。其他 Agent 可以参考这套协议迁移，但需要替换启动、resume 和权限参数等适配层。
+
+当前仓库公开发布的 skill 是 **Codex Collab**。它让一个主 Codex 学会当 coordinator，自己拆解复杂任务，调度持久 worker 会话，并把结果按队列收回审查。
 
 ---
 
-## 🚀 直接让 Agent 安装
+## 🚀 直接让 Codex 安装
 
-把下面这句话复制给你的 Agent：
-
-```text
-请从这个仓库安装需要的 skill：https://github.com/ZelongTAN/tot-skills
-```
-
-如果你只想安装 Codex Collab：
+把这句话复制给 Codex：
 
 ```text
 请帮我安装这个 skill：https://github.com/ZelongTAN/tot-skills/tree/main/skills/codex-collab
 ```
 
+如果你想安装整个集合：
+
+```text
+请帮我安装这个仓库里的 skills：https://github.com/ZelongTAN/tot-skills
+```
+
 ---
 
-## Skills
+## ✨ 当前 Skill
 
-| Skill | 作用 | 适合什么时候用 |
+| Skill | 它做什么 | 适合什么时候用 |
 |---|---|---|
-| [Codex Collab](skills/codex-collab/) | 让一个主 Codex 成为调度员，拆解复杂任务并调度持久 worker 会话 | 长任务、复杂代码任务、需要调研/实现/测试/审查分工时 |
+| [Codex Collab](skills/codex-collab/) | 让一个主 Codex 成为 coordinator，拆解复杂任务并调度持久 worker 会话 | 长任务、复杂代码任务、需要调研 / 实现 / 测试 / 审查分工的任务 |
 
----
+Codex Collab 的文档分成三层：
 
-## Codex Collab 简介
+- [人看的产品页](skills/codex-collab/README.md)：痛点、Before/After、亮点、安装入口和机制图。
+- [Agent 运行时入口](skills/codex-collab/SKILL.md)：Codex 触发 skill 后读取的精简操作说明。
+- [深入文档](skills/codex-collab/references/)：`usage.md` 是操作手册，`design.md` 是设计和可靠性说明。
 
-Codex Collab 不是让人手动管理一个“多 Agent 框架”。它给主 Codex 一个协作 skill：你仍然只和一个主 Codex 对接；主 Codex 可以自己拆任务、分配给持久 worker 会话、收集 handoff、排队审查，再把结论交还给你。
-
-**Before：一个 Codex 硬做到底**
-
-- 你把复杂任务交给一个 Codex。
-- 它自己理解需求、查资料、写代码、跑测试、审查结果。
-- 任务一长，上下文变重，职责混在一起，质量容易下滑。
-
-**After：一个主 Codex 调度持久 worker**
-
-- 👤 人只面对一个主 Codex
-- 🧠 主 Codex 负责拆解、调度、维护 dashboard 和最终判断
-- 🛠️ worker 会话负责实现、调研、测试、审查等子任务
-- 🔁 worker 完成后进入队列，主 Codex 按顺序审查
-- 📦 状态落在本地 JSON 和 run artifacts 里，适合长时间运行和恢复
-
-查看更多：[skills/codex-collab](skills/codex-collab/)
-
----
-
-## 跨平台说明
-
-- Windows / macOS / Linux 都可以使用。
-- Codex、Claude Code、OpenCode、OpenClaw 等支持 skill 的 Agent 都可以接入。
-- Claude 当然也能用，只是长期拿它烧 worker 会话有点像开跑车送外卖：技术上没问题，钱包可能先抗议。
+说明：Codex Collab 的完整平台边界在自己的文档里。当前仓库已经适配 Codex；其他 Agent 的迁移重点是启动、resume、权限和会话管理适配层。
 
 ---
 
