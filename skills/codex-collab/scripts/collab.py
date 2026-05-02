@@ -17,7 +17,7 @@ from typing import Any
 
 PRODUCT_NAME = "Codex Collab"
 CLI_NAME = "codex-collab"
-RUNNER_VERSION = "0.1.0"
+RUNNER_VERSION = "0.1.1"
 SCHEMA_VERSION = 1
 RUNTIME_DIR = ".codex-collab"
 LEGACY_RUNTIME_DIR = ".codex-collab"
@@ -40,6 +40,11 @@ LOCK_STALE_SECONDS = 900
 COORDINATOR_NOTIFY_STATUSES = {"review", "failed", "blocked", "needs-human"}
 QUEUE_STATES = ["pending", "running", "retry", "delivered", "resolved", "failed"]
 QUEUE_ACTIVE_STATES = {"pending", "retry", "running", "delivered"}
+WINDOWS_CMD_EXTENSIONS = {".cmd", ".bat"}
+ROOT_AFTER_SUBCOMMAND_HINT = (
+    "Global options such as --root must appear before the subcommand. "
+    f"Example: python {RUNTIME_DIR}/{INSTALLED_SCRIPT} --root <project-or-runtime-root> validate"
+)
 
 
 def now() -> datetime:
@@ -57,6 +62,101 @@ def parse_time(value: str) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def shell_quote_for_log(args: list[str]) -> str:
+    return " ".join(str(arg) if re.match(r"^[A-Za-z0-9_./:=+-]+$", str(arg)) else repr(str(arg)) for arg in args)
+
+
+def resolve_codex_executable() -> Path:
+    resolved = shutil.which("codex")
+    if not resolved:
+        raise FileNotFoundError("codex CLI not found on PATH.")
+    return Path(resolved)
+
+
+def build_codex_invocation(args: list[str]) -> tuple[list[str], list[str], Path]:
+    executable = resolve_codex_executable()
+    display_cmd = [str(executable), *args]
+    if os.name == "nt" and executable.suffix.lower() in WINDOWS_CMD_EXTENSIONS:
+        return ["cmd.exe", "/d", "/c", str(executable), *args], display_cmd, executable
+    return [str(executable), *args], display_cmd, executable
+
+
+def run_codex_cli(args: list[str], timeout: int, log_path: Path, prompt: str | None = None) -> int:
+    try:
+        cmd, display_cmd, executable = build_codex_invocation(args)
+    except FileNotFoundError as exc:
+        log_path.write_text(f"Codex CLI launch failed: {exc}\n", encoding="utf-8")
+        return 127
+    log_display = display_cmd
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout if timeout > 0 else None,
+        )
+        log_path.write_text(
+            "\n".join(
+                [
+                    f"Command: {shell_quote_for_log(log_display)}",
+                    f"ResolvedCodex: {executable}",
+                    f"PromptSource: {'stdin' if prompt is not None else 'argv'}",
+                    f"ExitCode: {proc.returncode}",
+                    "",
+                    "STDOUT:",
+                    proc.stdout,
+                    "STDERR:",
+                    proc.stderr,
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return proc.returncode
+    except PermissionError as exc:
+        log_path.write_text(
+            "\n".join(
+                [
+                    f"Command: {shell_quote_for_log(log_display)}",
+                    f"ResolvedCodex: {executable}",
+                    f"PromptSource: {'stdin' if prompt is not None else 'argv'}",
+                    f"LaunchError: {type(exc).__name__}: {exc}",
+                    "",
+                    "On Windows, .cmd/.bat Codex launchers are invoked through cmd.exe automatically.",
+                    "If this still fails, check file permissions and PATH resolution for the Codex CLI.",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return 126
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        log_path.write_text(
+            "\n".join(
+                [
+                    f"Command: {shell_quote_for_log(log_display)}",
+                    f"ResolvedCodex: {executable}",
+                    f"PromptSource: {'stdin' if prompt is not None else 'argv'}",
+                    f"Timeout: {timeout} seconds",
+                    "",
+                    "STDOUT:",
+                    str(stdout),
+                    "STDERR:",
+                    str(stderr),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return 124
 
 
 def find_root(start: Path | None = None) -> Path:
@@ -422,6 +522,24 @@ def make_queue_event(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def event_matches_current_task_attention(event: dict[str, Any], task: dict[str, Any], notify_statuses: set[str]) -> bool:
+    if not task_needs_coordinator(task, notify_statuses):
+        return False
+    current_run = str(task.get("lastRunId") or task.get("currentRunId") or "")
+    current_status = str(task.get("status", ""))
+    return str(event.get("runId", "")) == current_run and str(event.get("status", "")) == current_status
+
+
+def superseded_event_resolution(event: dict[str, Any], task: dict[str, Any] | None, notify_statuses: set[str]) -> str:
+    if not task or not task_needs_coordinator(task, notify_statuses):
+        return "Task no longer needs coordinator attention."
+    return (
+        "Queue event was superseded by a newer task run or status. "
+        f"Current run/status: {task.get('lastRunId') or task.get('currentRunId') or 'no-run'}/{task.get('status', '')}; "
+        f"event run/status: {event.get('runId') or 'no-run'}/{event.get('status', '')}."
+    )
+
+
 def enqueue_coordinator_event(root: Path, task: dict[str, Any]) -> tuple[str, bool] | tuple[None, False]:
     if not task_needs_coordinator(task, coordinator_notify_statuses(root)):
         return None, False
@@ -481,12 +599,12 @@ def reconcile_queue_events(root: Path) -> list[str]:
             if event.get("state") not in QUEUE_ACTIVE_STATES:
                 continue
             task = tasks_by_id.get(event.get("taskId"))
-            if task and task_needs_coordinator(task, notify_statuses):
+            if task and event_matches_current_task_attention(event, task, notify_statuses):
                 continue
             event["state"] = "resolved"
             event["updatedAt"] = iso_now()
             event["resolvedAt"] = iso_now()
-            event["resolution"] = "Task no longer needs coordinator attention."
+            event["resolution"] = superseded_event_resolution(event, task, notify_statuses)
             resolved.append(str(event.get("id", "")))
         if resolved:
             save_queue(root, queue)
@@ -512,11 +630,11 @@ def claim_coordinator_event(root: Path, coordinator: dict[str, Any]) -> dict[str
                 event["lastError"] = event.get("lastError") or "Max attempts exceeded."
                 continue
             task = tasks_by_id.get(event.get("taskId"))
-            if not task or not task_needs_coordinator(task, notify_statuses):
+            if not task or not event_matches_current_task_attention(event, task, notify_statuses):
                 event["state"] = "resolved"
                 event["updatedAt"] = iso_now()
                 event["resolvedAt"] = iso_now()
-                event["resolution"] = "Task no longer needs coordinator attention before delivery."
+                event["resolution"] = superseded_event_resolution(event, task, notify_statuses)
                 continue
             event["state"] = "running"
             event["attempts"] = int(event.get("attempts", 0) or 0) + 1
@@ -586,21 +704,12 @@ def run_coordinator_codex(root: Path, event: dict[str, Any], coordinator: dict[s
     log_dir.mkdir(parents=True, exist_ok=True)
     output_last = log_dir / f"{slugify(event['id'])}-last-message.md"
     prompt = coordinator_prompt(root, event)
-    cmd = ["codex", "exec", "resume"]
+    cmd = ["exec", "resume"]
     if coordinator.get("model"):
         cmd += ["-m", str(coordinator["model"])]
-    cmd += ["-o", str(output_last), "--skip-git-repo-check", session_id, prompt]
+    cmd += ["-o", str(output_last), "--skip-git-repo-check", session_id, "-"]
     log_path = log_dir / f"{slugify(event['id'])}.log"
-    try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout if timeout > 0 else None)
-        log_path.write_text(
-            f"Command: {' '.join(cmd[:-1])} <prompt>\nExitCode: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
-            encoding="utf-8",
-        )
-        return proc.returncode, log_path
-    except subprocess.TimeoutExpired as exc:
-        log_path.write_text(f"Coordinator Codex timed out after {timeout} seconds.\n{exc}\n", encoding="utf-8")
-        return 124, log_path
+    return run_codex_cli(cmd, timeout, log_path, prompt=prompt), log_path
 
 
 def process_coordinator_event(root: Path, event: dict[str, Any], coordinator: dict[str, Any], dry_run: bool, timeout: int) -> str:
@@ -731,9 +840,9 @@ def validate_queue(root: Path, queue: dict[str, Any], tasks_data: dict[str, Any]
         expected_id = queue_event_id(task_id, str(event.get("runId", "")), status)
         if event_id and event_id != expected_id:
             issues.append({"level": "warning", "message": f"{event_id}: expected event id '{expected_id}'."})
-        if state in {"pending", "retry", "running"} and not task_needs_coordinator(task, notify_statuses):
-            issues.append({"level": "warning", "message": f"{event_id}: active queue event references a task that no longer needs coordinator attention."})
-        if state == "resolved" and task_needs_coordinator(task, notify_statuses):
+        if state in {"pending", "retry", "running"} and not event_matches_current_task_attention(event, task, notify_statuses):
+            issues.append({"level": "warning", "message": f"{event_id}: active queue event is stale or superseded; run repair-queue to resolve it."})
+        if state == "resolved" and event_matches_current_task_attention(event, task, notify_statuses):
             issues.append({"level": "warning", "message": f"{event_id}: resolved queue event references a task that still needs coordinator attention."})
         if state == "running":
             claimed_at = parse_time(str(event.get("claimedAt", "")))
@@ -831,6 +940,8 @@ def doctor_issues(root: Path, live: bool) -> list[dict[str, str]]:
     codex_path = shutil.which("codex")
     if codex_path:
         issues.append({"level": "ok", "message": f"codex CLI found: {codex_path}."})
+        if os.name == "nt" and Path(codex_path).suffix.lower() in WINDOWS_CMD_EXTENSIONS:
+            issues.append({"level": "ok", "message": "Windows codex shim detected; live runner will invoke it through cmd.exe."})
     else:
         level = "error" if live else "warning"
         issues.append({"level": level, "message": "codex CLI not found on PATH; dry-run still works."})
@@ -1197,30 +1308,22 @@ Allowed handoff statuses are: done, blocked, needs-human, failed.
 Do not edit tasks.json or dashboard.md unless the task explicitly asks for coordination-system changes.
 Do not revert unrelated changes made by other workers or the user.
 """
-    cmd = ["codex", "exec"]
+    cmd = ["exec"]
     if worker_cfg.get("useResume") and worker_cfg.get("sessionId"):
         cmd += ["resume"]
         if worker_cfg.get("model"):
             cmd += ["-m", worker_cfg["model"]]
-        cmd += ["-o", str(output_last), "--skip-git-repo-check", worker_cfg["sessionId"], prompt]
+        cmd += ["-o", str(output_last), "--skip-git-repo-check", worker_cfg["sessionId"], "-"]
     else:
         if worker_cfg.get("model"):
             cmd += ["-m", worker_cfg["model"]]
         if worker_cfg.get("sandbox"):
             cmd += ["-s", worker_cfg["sandbox"]]
-        cmd += ["-C", cwd, "-o", str(output_last), "--skip-git-repo-check", prompt]
-    try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout if timeout > 0 else None)
-        (run_dir / "run.log").write_text(
-            f"Command: {' '.join(cmd[:-1])} <prompt>\nExitCode: {proc.returncode}\n\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
-            encoding="utf-8",
-        )
-        if not handoff_path.exists() and output_last.exists():
-            shutil.copyfile(output_last, handoff_path)
-        return proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        (run_dir / "run.log").write_text(f"Codex timed out after {timeout} seconds.\n{exc}\n", encoding="utf-8")
-        return 124
+        cmd += ["-C", cwd, "-o", str(output_last), "--skip-git-repo-check", "-"]
+    exit_code = run_codex_cli(cmd, timeout, run_dir / "run.log", prompt=prompt)
+    if not handoff_path.exists() and output_last.exists():
+        shutil.copyfile(output_last, handoff_path)
+    return exit_code
 
 
 def run_task(root: Path, worker: str, task: dict[str, Any], run_dir: Path, worker_cfg: dict[str, Any], dry_run: bool, timeout: int) -> str:
@@ -1675,8 +1778,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(raw_args)
+    except SystemExit:
+        subcommands: set[str] = set()
+        for action in parser._actions:
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict):
+                subcommands.update(str(choice) for choice in choices)
+        for index, value in enumerate(raw_args):
+            if value in subcommands and "--root" in raw_args[index + 1:]:
+                print(f"\nHint: {ROOT_AFTER_SUBCOMMAND_HINT}", file=sys.stderr)
+                break
+        raise
     args.func(args)
     return 0
 

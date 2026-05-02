@@ -84,6 +84,8 @@ taskId + runId + status
 
 That makes enqueue idempotent. The same handoff does not create duplicate events, but a retry with a new run id creates a new event.
 
+Only the event matching the task's current `lastRunId/currentRunId` and current status is considered the active attention event. Older queue events are history. If a task is retried or moved back into review with a new run id, earlier `resolved`, `pending`, `retry`, or `running` events for the same task are superseded and should not keep producing diagnosis noise.
+
 ## Reliability Model
 
 The queue is at-least-once, idempotent, and serial for coordinator wakeups.
@@ -153,6 +155,7 @@ flowchart TD
 | Runner re-checks task state after coordinator returns | Delivery and resolution are not confused |
 | Stale `running` events have a lease timeout | Crashed coordinator runner can recover |
 | `repair-queue` can rebuild missing pending events from `tasks.json` | Crash between finish and enqueue is recoverable |
+| Queue events are tied to current run id and status | Old events do not wake the coordinator after a retry |
 
 ## Crash Windows And Recovery
 
@@ -166,6 +169,7 @@ flowchart TD
 | Coordinator resume times out | Unknown whether coordinator saw prompt | retry with attempts limit; prompt must be idempotent |
 | Coordinator resume succeeds but does not change task | Event should not loop forever | mark `delivered`; expose unresolved task in dashboard |
 | User manually resolves task while event pending | Event is stale | runner re-checks task state and marks event `resolved` |
+| Task retries after an old event was resolved | Old event is historical | validator treats it as superseded; repair/runner create or process the new run event |
 | Queue file is corrupted | Events cannot be read | keep last-good backup; repair from `tasks.json`; unresolved tasks can be requeued |
 | Dashboard is stale | Human sees old view | regenerate from JSON truth |
 
@@ -218,6 +222,7 @@ Polling or watchdog can be added later only as an acceleration layer. The durabl
 | Coordinator resume fails | attempts increments; event becomes retry or failed |
 | Same task is retried | New run id creates a new event |
 | Same event is discovered twice | event id prevents duplicate enqueue |
+| Old event remains after a retry | Old event is superseded by the current run/status and ignored for wakeup |
 | Dashboard is stale | dashboard can be regenerated from JSON truth |
 | Main coordinator changes task status manually | queue processor re-checks task status before resuming |
 
@@ -285,9 +290,28 @@ Queue validation should flag:
 - event references to missing run ids when run evidence is expected
 - invalid event states
 - `running` events past lease timeout
-- `pending` events whose task no longer needs coordinator attention
-- `resolved` events whose task still needs coordinator attention
+- active events that no longer match the task's current run/status
+- `resolved` events only when they still match the task's current run/status and the task still needs coordinator attention
 - queue file schema mismatch
+
+Historical `resolved` events for earlier runs are not warnings. They are retained as audit history.
+
+## Codex CLI Invocation
+
+Live worker and coordinator execution share one launch path:
+
+```text
+resolve codex with shutil.which("codex")
+-> if Windows and the resolved file is .cmd/.bat, call cmd.exe /d /c <resolved> ...
+-> otherwise execute the resolved file directly
+-> send the prompt through stdin with "-"
+-> capture stdout/stderr as UTF-8 with errors="replace"
+-> write a UTF-8 run log
+```
+
+The runner avoids passing the full prompt as a command-line argument. This matters on Windows because npm shims often resolve to `.CMD` files and multiline prompts are fragile when routed through `cmd.exe`.
+
+Captured CLI output is not decoded with the process locale. It uses explicit UTF-8 replacement decoding so a Codex message containing non-ASCII output does not crash the runner under Windows GBK or other legacy locales.
 
 ## Implementation Principles
 

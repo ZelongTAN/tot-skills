@@ -40,6 +40,12 @@ python .codex-collab/collab.py validate
 python .codex-collab/collab.py dashboard
 ```
 
+When using global options, place them before the subcommand:
+
+```bash
+python .codex-collab/collab.py --root /path/to/project validate
+```
+
 If the installer is not available, create `.codex-collab/`, copy `scripts/collab.py` to `.codex-collab/collab.py`, then run:
 
 ```bash
@@ -109,6 +115,8 @@ Check live readiness:
 ```bash
 python .codex-collab/collab.py doctor --live
 ```
+
+Live Codex launch is cross-platform: the runner resolves `codex` with `shutil.which`, routes Windows `.cmd` / `.bat` shims through `cmd.exe`, sends prompts through stdin, and decodes captured output as UTF-8 with replacement.
 
 Run live worker/coordinator loops:
 

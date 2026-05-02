@@ -1,6 +1,6 @@
 # Codex Collab Usage
 
-Version: `0.1.0`
+Version: `0.1.1`
 
 Codex-first local runner for a main Codex coordinator and one or more persistent Codex worker sessions.
 
@@ -41,6 +41,19 @@ Then run from the target project:
 python .codex-collab/collab.py doctor
 python .codex-collab/collab.py validate
 python .codex-collab/collab.py dashboard
+```
+
+Global CLI options must appear before the subcommand:
+
+```bash
+python .codex-collab/collab.py --root /path/to/project validate
+```
+
+Do not place them after the subcommand:
+
+```bash
+# Wrong: argparse treats this as a validate-specific option.
+python .codex-collab/collab.py validate --root /path/to/project
 ```
 
 ## Daily Flow
@@ -208,5 +221,9 @@ For live Codex execution, each machine needs:
 - `config.json` worker `cwd` set to that machine's project or worktree path
 
 Use paths appropriate to the user's shell. Windows PowerShell, Bash on Linux, and zsh on macOS all work with the same runner.
+
+On Windows, `codex` may resolve to an npm shim such as `codex.CMD`. Live worker and coordinator launches resolve the executable with `shutil.which("codex")`; `.cmd` and `.bat` shims are invoked through `cmd.exe`, while `.exe` and Unix executables are launched directly.
+
+Live prompts are sent through stdin using `-`, not as one giant command-line argument. This keeps multiline prompts stable across Windows, macOS, and Linux. Captured CLI output is decoded as UTF-8 with replacement for invalid bytes, so non-ASCII CLI output should not crash the runner on GBK or other legacy Windows locales.
 
 Codex Collab is Codex-first. The live worker and coordinator paths currently call Codex-specific commands such as `codex exec resume` and use Codex session ids and permission flags. Other Agent runtimes can port the JSON-first protocol, but need their own launch/resume adapter before they are live-compatible.
