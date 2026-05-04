@@ -14,6 +14,8 @@ The usual problem is that one Codex has to do everything by itself: understand t
 
 Codex Collab is not framed as "humans managing multiple agents." It is a skill that lets the main Codex become a coordinator. You still talk to one Codex. That Codex can decompose the goal, dispatch subtasks to persistent worker Codex sessions, collect handoffs, review them in order, and report the next decision back to you.
 
+The most important point is not parallelism by itself. It is giving each workstream a persistent worker identity. That worker can later be resumed, questioned, asked to fill gaps, or pushed through a second round. The main Codex stays in the coordinator role: provide background, specify what to read, specify what to write back, review the handoff, and decide the next step.
+
 In short:
 
 - 👤 the human talks to one main Codex
@@ -136,8 +138,10 @@ flowchart TD
 Key points:
 
 - Workers read `tasks.json` and their task snapshot, not `dashboard.md`.
+- For gap-filling, follow-up questions, rework, and second-pass review on the same workstream, prefer reusing the same worker instead of spawning fresh parallel branches.
 - Worker completion follows a fixed exit path that writes a handoff and queue event.
 - Multiple workers can finish in parallel, while the main Codex reviews queue events serially.
+- Task briefs do not need a heavy template, but they should clearly state background, first files to read, expected deliverable, and validation.
 - If a process crashes after updating a task but before enqueueing, `repair-queue` can rebuild the missing event from `tasks.json`.
 - `dashboard.md` is only a view; JSON remains the source of truth.
 
@@ -175,6 +179,7 @@ It creates:
   coordinator_queue.json   coordinator wakeup queue
   dashboard.md             generated readable dashboard
   runs/                    worker run evidence
+  reviews/                 coordinator review prompts and logs
   state/                   locks, heartbeats, stop files
 ```
 
@@ -209,18 +214,23 @@ Configure `.codex-collab/config.json`:
       "sessionId": "worker-codex-session-id",
       "model": "gpt-5.4",
       "reasoningEffort": "xhigh",
+      "approvalPolicy": "on-request",
+      "search": true,
       "sandbox": "workspace-write"
     }
   },
   "coordinator": {
     "sessionId": "main-codex-session-id",
     "model": "gpt-5.4",
-    "reasoningEffort": "xhigh"
+    "reasoningEffort": "xhigh",
+    "approvalPolicy": "on-request",
+    "search": true,
+    "sandbox": "workspace-write"
   }
 }
 ```
 
-You can also override these for one live loop:
+`model` and `reasoningEffort` are optional. `cwd`, `sandbox`, `approvalPolicy`, and `search` define the actual live resume environment. You can also override model and reasoning for one live loop:
 
 ```bash
 python .codex-collab/collab.py start-worker --worker worker-a --model gpt-5.4 --reasoning-effort xhigh
@@ -234,6 +244,8 @@ python .codex-collab/collab.py doctor --live
 python .codex-collab/collab.py start-worker --worker worker-a
 python .codex-collab/collab.py run-coordinator
 ```
+
+On Windows, if `codex` resolves to a shim such as `codex.cmd` or `codex.bat`, the runner invokes it through `cmd.exe` automatically. On macOS, Linux, or direct executables, it launches the resolved binary directly. Captured CLI output is decoded as UTF-8 with replacement, so the live loop does not crash on locale-specific output.
 
 For code-changing workers, separate git worktrees are strongly recommended. Codex Collab handles handoff, queueing, and records; it does not magically remove file conflicts.
 

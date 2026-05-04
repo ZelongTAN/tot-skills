@@ -8,9 +8,12 @@ This document records the architecture for the collaboration runner. It separate
 - `coordinator_queue.json` is the coordinator wakeup truth source.
 - `dashboard.md` is generated output only.
 - `runs/` stores execution evidence for each worker attempt.
+- `reviews/` stores execution evidence for each coordinator review attempt.
 - `state/` stores locks, heartbeat files, and stop files.
 
 Workers do not parse the dashboard to find work. They read `tasks.json` directly.
+
+This protocol is not centered on generic parallel jobs. It is centered on persistent worker sessions plus a coordinator review loop. Parallel execution is useful, but the durable object in the system is the worker identity and its follow-up trail across task, run evidence, handoff, and later resume.
 
 ## Main Flow
 
@@ -29,7 +32,10 @@ Plain version:
 - `tasks.json` is the class assignment book. It is the source of truth.
 - `dashboard.md` is the classroom board. It is for reading, not storing truth.
 - `runs/` is scratch paper and submitted work for each attempt.
+- `reviews/` is the coordinator's review folder for each queue event it actively processes.
 - `state/` is heartbeat, stop files, and locks.
+
+Artifact file names are fixed on purpose. Humans and Agents should be able to find the prompt, snapshot, handoff, and logs for a given run or review without reconstructing custom names.
 
 ## Coordinator Queue
 
@@ -47,6 +53,8 @@ flowchart TD
 ```
 
 The queue is a durable line of workers waiting to talk to the coordinator. If three workers finish while the coordinator is busy, three queue events wait their turn.
+
+In other words, `coordinator_queue.json` is a callback queue for persistent workers, not a generic parallel job pool. Its purpose is to bring reviewed follow-up back to the coordinator in order.
 
 Queue file:
 
@@ -70,7 +78,12 @@ Queue shape:
       "state": "pending",
       "createdAt": "2026-05-02T14:30:00+08:00",
       "attempts": 0,
-      "lastError": ""
+      "lastError": "",
+      "reviewPath": "reviews/task-001-12ab34cd",
+      "eventPath": "reviews/task-001-12ab34cd/event.json",
+      "promptPath": "reviews/task-001-12ab34cd/coordinator-prompt.md",
+      "runLogPath": "reviews/task-001-12ab34cd/run.log",
+      "lastMessagePath": "reviews/task-001-12ab34cd/last-message.md"
     }
   ]
 }
@@ -83,6 +96,8 @@ taskId + runId + status
 ```
 
 That makes enqueue idempotent. The same handoff does not create duplicate events, but a retry with a new run id creates a new event.
+
+Each queue event also carries fixed review-artifact pointers so humans and agents can jump from the queue directly into the coordinator's review folder without reconstructing paths.
 
 Only the event matching the task's current `lastRunId/currentRunId` and current status is considered the active attention event. Older queue events are history. If a task is retried or moved back into review with a new run id, earlier `resolved`, `pending`, `retry`, or `running` events for the same task are superseded and should not keep producing diagnosis noise.
 
@@ -267,9 +282,13 @@ Not included:
 ```json
 {
   "coordinator": {
+    "cwd": ".",
     "sessionId": "",
     "model": "",
     "reasoningEffort": "",
+    "sandbox": "workspace-write",
+    "approvalPolicy": "",
+    "search": false,
     "pollSeconds": 5,
     "codexTimeoutSeconds": 1800,
     "maxAttempts": 3,

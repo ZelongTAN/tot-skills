@@ -7,6 +7,15 @@ description: Set up and operate Codex Collab, a Codex-first JSON coordination sk
 
 Give one main Codex a coordinator desk.
 
+This skill is not mainly about parallel search. Its core is persistent worker identity.
+
+Each worker is meant to be a continuing session with its own scope, context, and follow-up history. A worker can be resumed, questioned again, asked for a second pass, or given a narrower retry. The main Codex should act as the coordinator: give enough background, specify what to read, specify what to write back, review the handoff, and then decide the next round.
+
+Default rule of thumb:
+
+- Reuse the same worker when the next step is a follow-up on the same workstream: patch a gap, answer review feedback, extend the same implementation, or run a second pass.
+- Open a different worker when the workstream truly changes: different files, different role, different expertise, or intentionally independent review.
+
 The user should keep talking to one main Codex. That coordinator Codex uses a project-local `.codex-collab/` workspace to split work, assign persistent worker Codex sessions, collect handoffs, review results, and keep the dashboard current. The human should not become the message bus.
 
 Codex Collab is JSON-first:
@@ -14,6 +23,7 @@ Codex Collab is JSON-first:
 - `tasks.json` is the task source of truth.
 - `coordinator_queue.json` is the coordinator wakeup source of truth.
 - `runs/` stores worker evidence: task snapshots, logs, and handoffs.
+- queue events carry direct pointers into `reviews/` so the coordinator can open the review prompt, event snapshot, log, and last message without guessing paths.
 - `dashboard.md` is a generated view for humans and the coordinator to scan.
 
 ## First, Set The Boundary
@@ -57,17 +67,79 @@ python .codex-collab/collab.py init
 When the user gives a complex task:
 
 1. Act as the coordinator, not as a one-session hero.
-2. Break the goal into small, low-coupling worker tasks.
-3. Keep code-changing workers in separate git worktrees when possible.
-4. Create tasks with clear owners, goals, and review expectations.
-5. Run read-only dry-run previews before live worker/coordinator runs.
-6. Review handoffs before accepting, retrying, or asking the user.
-7. Regenerate the dashboard after meaningful state changes.
+2. Treat workers as persistent specialists you may resume later, not as disposable parallel searches.
+3. Break the goal into small, low-coupling worker tasks.
+4. Give each task enough background, reading pointers, and handoff expectations to stand on its own.
+5. Prefer reusing or re-briefing the same worker identity when a second pass belongs to the same thread of work.
+6. Keep code-changing workers in separate git worktrees when possible.
+7. Run read-only dry-run previews before live worker/coordinator runs.
+8. Review handoffs before accepting, retrying, or asking the user.
+9. Regenerate the dashboard after meaningful state changes.
 
 Create a worker task:
 
 ```bash
 python .codex-collab/collab.py new-task --owner worker-a --title "Task title" --goal "Concrete outcome"
+```
+
+## Task Brief Pattern
+
+When the coordinator creates a worker task, keep it light but specific.
+
+Write the task as if this worker may be resumed later for a second round. The brief should preserve enough identity and context that the same worker can be asked follow-up questions instead of being replaced by a brand-new branch.
+
+If a worker returns a useful but incomplete handoff, do not reflexively fan the same topic out into new parallel branches. First ask whether the same worker should patch the gap and keep continuity.
+
+What the runner already injects automatically:
+
+- the source-of-truth paths such as `tasks.json`
+- the worker's task snapshot under `runs/<run-id>/task.json`
+- the required handoff path under `runs/<run-id>/handoff.md`
+- the expected handoff sections and allowed status values
+
+What the coordinator still needs to say clearly:
+
+- background: why this task exists and what larger goal it supports
+- read first: the few project files or folders the worker should inspect first
+- boundary: what not to change, or what area the worker owns
+- deliverable: what a good result should contain
+- validation: which checks to run, or when explanation is acceptable
+
+Map that onto the CLI fields:
+
+- `--goal`: one-sentence outcome
+- `--context`: background, known facts, and the first files to read
+- `--boundary`: constraints and non-goals
+- `--deliverable`: what should appear in the handoff or code result
+- `--validation`: required checks
+
+Do not waste task space repeating the runtime plumbing. The runner already tells the worker where the handoff goes and which Collab files are truth sources.
+
+Implementation-style example:
+
+```bash
+python .codex-collab/collab.py new-task ^
+  --owner worker-a ^
+  --title "Tighten queue retry handling" ^
+  --goal "Make stale queue events resolve cleanly without noisy warnings." ^
+  --context "Background: users are seeing stale queue warnings after retries. Read first: skills/codex-collab/scripts/collab.py and skills/codex-collab/references/design.md. Keep the change scoped to queue validation and reconciliation." ^
+  --boundary "Do not redesign the queue model or add new storage." ^
+  --deliverable "Code change plus a short handoff that explains the new stale-event behavior." ^
+  --validation "Run python -m py_compile skills/codex-collab/scripts/collab.py." ^
+  --validation "Run python skills/codex-collab/scripts/collab.py validate."
+```
+
+Read-only research example:
+
+```bash
+python .codex-collab/collab.py new-task ^
+  --owner worker-b ^
+  --title "Research lighter task briefing patterns" ^
+  --goal "Produce a short recommendation for how coordinator prompts should specify context and file-reading order." ^
+  --context "This is a read-only research task. Read first: skills/codex-collab/SKILL.md and skills/codex-collab/references/usage.md. Compare the current task-writing guidance with common failure modes: vague background, missing file pointers, missing validation expectations." ^
+  --boundary "Do not change code or docs in this task." ^
+  --deliverable "Write a concise handoff with 3-5 recommendations and 1-2 example task phrasings." ^
+  --validation "Validation is reasoning-only; note that no commands were run."
 ```
 
 Preview one worker without mutating state:
@@ -130,6 +202,8 @@ python .codex-collab/collab.py doctor --live
 Live Codex launch is cross-platform: the runner resolves `codex` with `shutil.which`, routes Windows `.cmd` / `.bat` shims through `cmd.exe`, sends prompts through stdin, and decodes captured output as UTF-8 with replacement.
 
 `model` and `reasoningEffort` are optional. The coordinator can also override them for a single loop with `--model gpt-5.4 --reasoning-effort xhigh`.
+
+For persistent worker sessions, remember that `resume` is about continuity, not capability by itself. The live runner should still resume with the intended `cwd`, sandbox/approval posture, and optional search setting so the worker returns to the right execution environment instead of falling back to a weaker session default.
 
 Run live worker/coordinator loops:
 

@@ -14,6 +14,8 @@
 
 Codex Collab 的切入点不是让人手动操作一个“多 Agent 框架”，而是给 Codex 装一个协作 skill：你仍然只和一个主 Codex 对接；这个主 Codex 可以把自己升级成 coordinator，自己拆解任务、把子任务分配给持久 worker 会话、收集 handoff、排队审查，再把结论交还给你。
 
+这里最关键的，不是“多开几个并行方向”本身，而是让每个方向拥有一个可持续的 worker 身份：它后续可以被 resume、被追问、被要求补洞或做二轮。主 Codex 则负责调度、补背景、规定写入位置、审查 handoff，再决定下一轮怎么走。
+
 换句话说：
 
 - 👤 人只需要面对一个主 Codex
@@ -138,8 +140,10 @@ flowchart TD
 关键点：
 
 - worker 不需要读 dashboard；它们读 `tasks.json` 和自己的 task snapshot。
+- 同一条工作线上的补洞、追问、返工和二轮复核，优先复用原 worker，而不是重新散成新的并行分支。
 - worker 完成后通过固定结束路径写 handoff 和 queue event，不靠文件系统 watcher 猜。
 - 多个 worker 可以并行完成，主 Codex 仍然按队列串行审查。
+- 派任务时不需要重模板，但最好把背景、先读哪些文件、预期交付物和验证方式说清楚。
 - 如果崩在“任务已更新但队列没写入”的窗口，`repair-queue` 可以从 `tasks.json` 补回事件。
 - `dashboard.md` 只是给人和 coordinator 看的视图，真相仍然在 JSON。
 
@@ -177,6 +181,7 @@ python skills/codex-collab/scripts/collab.py install --target /path/to/project -
   coordinator_queue.json   coordinator wakeup queue
   dashboard.md             generated readable dashboard
   runs/                    worker run evidence
+  reviews/                 coordinator review prompts and logs
   state/                   locks, heartbeats, stop files
 ```
 
@@ -211,18 +216,23 @@ python .codex-collab/collab.py status
       "sessionId": "worker-codex-session-id",
       "model": "gpt-5.4",
       "reasoningEffort": "xhigh",
+      "approvalPolicy": "on-request",
+      "search": true,
       "sandbox": "workspace-write"
     }
   },
   "coordinator": {
     "sessionId": "main-codex-session-id",
     "model": "gpt-5.4",
-    "reasoningEffort": "xhigh"
+    "reasoningEffort": "xhigh",
+    "approvalPolicy": "on-request",
+    "search": true,
+    "sandbox": "workspace-write"
   }
 }
 ```
 
-`model` 和 `reasoningEffort` 都是可选项；不写时使用本机 Codex CLI 默认设置。也可以只对某一次 live loop 临时覆盖：
+`model` 和 `reasoningEffort` 都是可选项；不写时使用本机 Codex CLI 默认设置。`cwd`、`sandbox`、`approvalPolicy` 和 `search` 则决定 live resume 时的实际执行环境。也可以只对某一次 live loop 临时覆盖：
 
 ```bash
 python .codex-collab/collab.py start-worker --worker worker-a --model gpt-5.4 --reasoning-effort xhigh
@@ -236,6 +246,8 @@ python .codex-collab/collab.py doctor --live
 python .codex-collab/collab.py start-worker --worker worker-a
 python .codex-collab/collab.py run-coordinator
 ```
+
+在 Windows 上，如果 `codex` 实际解析到 `codex.cmd` / `codex.bat` 这类 shim，runner 会自动通过 `cmd.exe` 调用；在 macOS / Linux 或直接是 `.exe` 时则直接执行。CLI 输出统一按 UTF-8 捕获并容错解码，所以不会因为 Windows 默认编码把 live loop 弄崩。
 
 建议：会改代码的 worker 尽量放在不同 git worktree 里。Codex Collab 负责传递、排队和记录，不负责魔法般消除文件冲突。
 

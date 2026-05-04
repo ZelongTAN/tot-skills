@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,8 @@ TASK_STATUSES = [
 ATTENTION_STATUSES = {"needs-approval", "needs-human", "blocked", "failed"}
 RISK_VALUES = {"low", "medium", "high"}
 REASONING_EFFORT_VALUES = {"minimal", "low", "medium", "high", "xhigh"}
+SANDBOX_VALUES = {"read-only", "workspace-write", "danger-full-access"}
+APPROVAL_POLICY_VALUES = {"untrusted", "on-failure", "on-request", "never"}
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,79}$")
 LOCK_STALE_SECONDS = 900
 COORDINATOR_NOTIFY_STATUSES = {"review", "failed", "blocked", "needs-human"}
@@ -171,6 +174,14 @@ def codex_model_args(config: dict[str, Any]) -> list[str]:
     return args
 
 
+def codex_live_args(config: dict[str, Any], cwd: str, allow_cd: bool = True) -> list[str]:
+    args = codex_global_runtime_args(config, cwd if allow_cd else "")
+    args += codex_model_args(config)
+    if truthy(config.get("fullAuto")):
+        args.append("--full-auto")
+    return args
+
+
 def merge_runtime_overrides(config: dict[str, Any], model: str = "", reasoning_effort: str = "") -> dict[str, Any]:
     merged = dict(config)
     if model:
@@ -178,6 +189,14 @@ def merge_runtime_overrides(config: dict[str, Any], model: str = "", reasoning_e
     if reasoning_effort:
         merged["reasoningEffort"] = reasoning_effort
     return merged
+
+
+def truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def find_root(start: Path | None = None) -> Path:
@@ -258,9 +277,13 @@ def queue_lock(root: Path):
 def default_config(root: Path) -> dict[str, Any]:
     return {
         "coordinator": {
+            "cwd": str(root.parent),
             "sessionId": "",
             "model": "",
             "reasoningEffort": "",
+            "sandbox": "workspace-write",
+            "approvalPolicy": "",
+            "search": False,
             "pollSeconds": 5,
             "codexTimeoutSeconds": 1800,
             "maxAttempts": 3,
@@ -274,6 +297,8 @@ def default_config(root: Path) -> dict[str, Any]:
                 "reasoningEffort": "",
                 "useResume": False,
                 "sessionId": "",
+                "approvalPolicy": "",
+                "search": False,
                 "pollSeconds": 5,
                 "codexTimeoutSeconds": 3600,
                 "staleRunningMinutes": 240,
@@ -345,6 +370,7 @@ def default_tasks() -> dict[str, Any]:
 def ensure_layout(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "runs").mkdir(parents=True, exist_ok=True)
+    (root / "reviews").mkdir(parents=True, exist_ok=True)
     (root / "state").mkdir(parents=True, exist_ok=True)
     config_path = root / "config.json"
     if not config_path.exists():
@@ -352,15 +378,29 @@ def ensure_layout(root: Path) -> None:
     else:
         config = load_json(config_path, {})
         changed = False
+        defaults_all = default_config(root)
         if "coordinator" not in config or not isinstance(config.get("coordinator"), dict):
-            config["coordinator"] = default_config(root)["coordinator"]
+            config["coordinator"] = defaults_all["coordinator"]
             changed = True
         else:
-            defaults = default_config(root)["coordinator"]
+            defaults = defaults_all["coordinator"]
             for key, value in defaults.items():
                 if key not in config["coordinator"]:
                     config["coordinator"][key] = value
                     changed = True
+        workers = config.get("workers")
+        if not isinstance(workers, dict):
+            config["workers"] = defaults_all["workers"]
+            changed = True
+        else:
+            worker_defaults = defaults_all["workers"]["worker-a"]
+            for worker_name, worker_cfg in list(workers.items()):
+                if not isinstance(worker_cfg, dict):
+                    continue
+                for key, value in worker_defaults.items():
+                    if key not in worker_cfg:
+                        worker_cfg[key] = value
+                        changed = True
         if changed:
             write_json(config_path, config)
     tasks_path = root / "tasks.json"
@@ -412,6 +452,14 @@ def slugify(text: str) -> str:
     return (slug or "task")[:42].strip("-") or "task"
 
 
+def stable_artifact_dirname(text: str, fallback: str, prefix_limit: int = 48, digest_len: int = 8) -> str:
+    normalized = text.strip() or fallback
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:digest_len]
+    prefix_budget = max(8, prefix_limit - digest_len - 1)
+    prefix = slugify(normalized)[:prefix_budget].strip("-") or fallback
+    return f"{prefix}-{digest}"
+
+
 def make_task_id(title: str) -> str:
     return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(title)}"
 
@@ -421,6 +469,71 @@ def rel(root: Path, path: Path) -> str:
         return path.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         return str(path)
+
+
+def worker_handoff_path(run_dir: Path) -> Path:
+    return run_dir / "handoff.md"
+
+
+def worker_prompt_path(run_dir: Path) -> Path:
+    return run_dir / "worker-prompt.md"
+
+
+def worker_task_snapshot_path(run_dir: Path) -> Path:
+    return run_dir / "task.json"
+
+
+def worker_last_message_path(run_dir: Path) -> Path:
+    return run_dir / "last-message.md"
+
+
+def worker_run_log_path(run_dir: Path) -> Path:
+    return run_dir / "run.log"
+
+
+def review_dir(root: Path, event: dict[str, Any]) -> Path:
+    return root / "reviews" / stable_artifact_dirname(str(event.get("id", "")), "review")
+
+
+def coordinator_event_snapshot_path(root: Path, event: dict[str, Any]) -> Path:
+    return review_dir(root, event) / "event.json"
+
+
+def coordinator_prompt_path(root: Path, event: dict[str, Any]) -> Path:
+    return review_dir(root, event) / "coordinator-prompt.md"
+
+
+def coordinator_last_message_path(root: Path, event: dict[str, Any]) -> Path:
+    return review_dir(root, event) / "last-message.md"
+
+
+def coordinator_run_log_path(root: Path, event: dict[str, Any]) -> Path:
+    return review_dir(root, event) / "run.log"
+
+
+def queue_event_artifact_fields(root: Path, event: dict[str, Any]) -> dict[str, str]:
+    return {
+        "reviewPath": rel(root, review_dir(root, event)),
+        "eventPath": rel(root, coordinator_event_snapshot_path(root, event)),
+        "promptPath": rel(root, coordinator_prompt_path(root, event)),
+        "runLogPath": rel(root, coordinator_run_log_path(root, event)),
+        "lastMessagePath": rel(root, coordinator_last_message_path(root, event)),
+    }
+
+
+def attach_queue_event_artifact_fields(root: Path, event: dict[str, Any]) -> dict[str, Any]:
+    event.update(queue_event_artifact_fields(root, event))
+    return event
+
+
+def sync_review_artifacts(root: Path, events: list[dict[str, Any]]) -> None:
+    seen: set[str] = set()
+    for event in events:
+        event_id = str(event.get("id", "")).strip()
+        if not event_id or event_id in seen:
+            continue
+        seen.add(event_id)
+        prepare_review_artifacts(root, event)
 
 
 def normalize_list(values: list[str] | None, default: list[str]) -> list[str]:
@@ -442,14 +555,55 @@ def get_coordinator(root: Path) -> dict[str, Any]:
     return {**defaults, **coordinator}
 
 
-def worker_cwd(root: Path, worker_cfg: dict[str, Any]) -> str:
-    configured = str(worker_cfg.get("cwd") or "")
+def resolve_cwd(root: Path, configured: Any, fallback: Path) -> str:
+    configured = str(configured or "")
     if not configured:
-        return str(root.parent)
+        return str(fallback.resolve())
     path = Path(configured).expanduser()
     if not path.is_absolute():
         path = root.parent / path
     return str(path.resolve())
+
+
+def worker_cwd(root: Path, worker_cfg: dict[str, Any]) -> str:
+    return resolve_cwd(root, worker_cfg.get("cwd"), root.parent)
+
+
+def coordinator_cwd(root: Path, coordinator_cfg: dict[str, Any]) -> str:
+    return resolve_cwd(root, coordinator_cfg.get("cwd"), root.parent)
+
+
+def codex_global_runtime_args(config: dict[str, Any], cwd: str) -> list[str]:
+    args: list[str] = []
+    if cwd:
+        args += ["-C", cwd]
+    sandbox = str(config.get("sandbox", "")).strip()
+    if sandbox:
+        args += ["-s", sandbox]
+    approval_policy = str(config.get("approvalPolicy", "")).strip()
+    if approval_policy:
+        args += ["-a", approval_policy]
+    if truthy(config.get("search")):
+        args += ["--search"]
+    return args
+
+
+def process_exists(pid: Any) -> bool | None:
+    try:
+        pid_value = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid_value <= 0:
+        return None
+    try:
+        os.kill(pid_value, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def find_task(data: dict[str, Any], task_id: str) -> dict[str, Any] | None:
@@ -530,12 +684,12 @@ def active_event_exists(queue: dict[str, Any], event_id: str) -> bool:
     return any(event.get("id") == event_id and event.get("state") in QUEUE_ACTIVE_STATES for event in queue.get("events", []))
 
 
-def make_queue_event(task: dict[str, Any]) -> dict[str, Any]:
+def make_queue_event(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     task_id = str(task.get("id", ""))
     run_id = str(task.get("lastRunId") or task.get("currentRunId") or "")
     status = str(task.get("status", ""))
     event_id = queue_event_id(task_id, run_id, status)
-    return {
+    return attach_queue_event_artifact_fields(root, {
         "id": event_id,
         "taskId": task_id,
         "runId": run_id,
@@ -546,7 +700,7 @@ def make_queue_event(task: dict[str, Any]) -> dict[str, Any]:
         "updatedAt": iso_now(),
         "attempts": 0,
         "lastError": "",
-    }
+    })
 
 
 def event_matches_current_task_attention(event: dict[str, Any], task: dict[str, Any], notify_statuses: set[str]) -> bool:
@@ -570,14 +724,28 @@ def superseded_event_resolution(event: dict[str, Any], task: dict[str, Any] | No
 def enqueue_coordinator_event(root: Path, task: dict[str, Any]) -> tuple[str, bool] | tuple[None, False]:
     if not task_needs_coordinator(task, coordinator_notify_statuses(root)):
         return None, False
-    event = make_queue_event(task)
+    event = make_queue_event(root, task)
+    event_to_sync: dict[str, Any] | None = None
+    created = False
     with queue_lock(root):
         queue = load_queue(root)
-        if active_event_exists(queue, event["id"]):
-            return event["id"], False
-        queue.setdefault("events", []).append(event)
-        save_queue(root, queue)
-    return event["id"], True
+        for existing in queue.get("events", []):
+            if existing.get("id") != event["id"] or existing.get("state") not in QUEUE_ACTIVE_STATES:
+                continue
+            before = clone_json(existing)
+            attach_queue_event_artifact_fields(root, existing)
+            if existing != before:
+                save_queue(root, queue)
+            event_to_sync = clone_json(existing)
+            break
+        if event_to_sync is None:
+            queue.setdefault("events", []).append(event)
+            save_queue(root, queue)
+            event_to_sync = clone_json(event)
+            created = True
+    if event_to_sync:
+        sync_review_artifacts(root, [event_to_sync])
+    return event["id"], created
 
 
 def repair_queue(root: Path) -> tuple[list[str], list[str]]:
@@ -599,6 +767,7 @@ def recover_stale_queue_events(root: Path, lease_minutes: int) -> None:
         return
     cutoff = now() - timedelta(minutes=lease_minutes)
     changed = False
+    changed_events: list[dict[str, Any]] = []
     with queue_lock(root):
         queue = load_queue(root)
         for event in queue.get("events", []):
@@ -610,9 +779,12 @@ def recover_stale_queue_events(root: Path, lease_minutes: int) -> None:
             event["state"] = "retry"
             event["updatedAt"] = iso_now()
             event["lastError"] = "Coordinator event lease expired."
+            attach_queue_event_artifact_fields(root, event)
+            changed_events.append(clone_json(event))
             changed = True
         if changed:
             save_queue(root, queue)
+    sync_review_artifacts(root, changed_events)
 
 
 def reconcile_queue_events(root: Path) -> list[str]:
@@ -620,6 +792,7 @@ def reconcile_queue_events(root: Path) -> list[str]:
     notify_statuses = coordinator_notify_statuses(root)
     tasks_by_id = {task.get("id"): task for task in data.get("tasks", []) if isinstance(task, dict)}
     resolved: list[str] = []
+    changed_events: list[dict[str, Any]] = []
     with queue_lock(root):
         queue = load_queue(root)
         for event in queue.get("events", []):
@@ -632,9 +805,12 @@ def reconcile_queue_events(root: Path) -> list[str]:
             event["updatedAt"] = iso_now()
             event["resolvedAt"] = iso_now()
             event["resolution"] = superseded_event_resolution(event, task, notify_statuses)
+            attach_queue_event_artifact_fields(root, event)
+            changed_events.append(clone_json(event))
             resolved.append(str(event.get("id", "")))
         if resolved:
             save_queue(root, queue)
+    sync_review_artifacts(root, changed_events)
     return resolved
 
 
@@ -644,6 +820,9 @@ def claim_coordinator_event(root: Path, coordinator: dict[str, Any]) -> dict[str
     notify_statuses = {str(status) for status in configured_statuses if str(status) in TASK_STATUSES} if isinstance(configured_statuses, list) else set(COORDINATOR_NOTIFY_STATUSES)
     if not notify_statuses:
         notify_statuses = set(COORDINATOR_NOTIFY_STATUSES)
+    claimed_event: dict[str, Any] | None = None
+    changed = False
+    changed_events: list[dict[str, Any]] = []
     with queue_lock(root):
         queue = load_queue(root)
         data = load_tasks(root)
@@ -655,6 +834,9 @@ def claim_coordinator_event(root: Path, coordinator: dict[str, Any]) -> dict[str
                 event["state"] = "failed"
                 event["updatedAt"] = iso_now()
                 event["lastError"] = event.get("lastError") or "Max attempts exceeded."
+                attach_queue_event_artifact_fields(root, event)
+                changed_events.append(clone_json(event))
+                changed = True
                 continue
             task = tasks_by_id.get(event.get("taskId"))
             if not task or not event_matches_current_task_attention(event, task, notify_statuses):
@@ -662,14 +844,24 @@ def claim_coordinator_event(root: Path, coordinator: dict[str, Any]) -> dict[str
                 event["updatedAt"] = iso_now()
                 event["resolvedAt"] = iso_now()
                 event["resolution"] = superseded_event_resolution(event, task, notify_statuses)
+                attach_queue_event_artifact_fields(root, event)
+                changed_events.append(clone_json(event))
+                changed = True
                 continue
             event["state"] = "running"
             event["attempts"] = int(event.get("attempts", 0) or 0) + 1
             event["claimedAt"] = iso_now()
             event["updatedAt"] = iso_now()
+            attach_queue_event_artifact_fields(root, event)
+            claimed_event = clone_json(event)
+            changed_events.append(claimed_event)
+            changed = True
+            break
+        if changed:
             save_queue(root, queue)
-            return json.loads(json.dumps(event))
-        save_queue(root, queue)
+    sync_review_artifacts(root, changed_events)
+    if claimed_event:
+        return claimed_event
     return None
 
 
@@ -690,11 +882,14 @@ def peek_coordinator_event(root: Path, coordinator: dict[str, Any]) -> dict[str,
         task = tasks_by_id.get(event.get("taskId"))
         if not task or not event_matches_current_task_attention(event, task, notify_statuses):
             continue
-        return clone_json(event)
+        preview = clone_json(event)
+        attach_queue_event_artifact_fields(root, preview)
+        return preview
     return None
 
 
 def update_queue_event(root: Path, event_id: str, state: str, **fields: Any) -> None:
+    updated_event: dict[str, Any] | None = None
     with queue_lock(root):
         queue = load_queue(root)
         for event in queue.get("events", []):
@@ -703,9 +898,13 @@ def update_queue_event(root: Path, event_id: str, state: str, **fields: Any) -> 
             event["state"] = state
             event["updatedAt"] = iso_now()
             event.update(fields)
+            attach_queue_event_artifact_fields(root, event)
+            updated_event = clone_json(event)
             save_queue(root, queue)
-            return
+            break
+    if not updated_event:
         raise SystemExit(f"Coordinator queue event not found: {event_id}")
+    sync_review_artifacts(root, [updated_event])
 
 
 def event_still_needs_coordinator(root: Path, event: dict[str, Any]) -> bool:
@@ -731,6 +930,10 @@ def print_coordinator_event_preview(event: dict[str, Any] | None) -> None:
     print(f"Dry-run preview: coordinator would process event {event.get('id')}.")
     print(f"  task/status: {event.get('taskId', '')}/{event.get('status', '')}")
     print(f"  state/attempts: {event.get('state', '')}/{event.get('attempts', 0)}")
+    if event.get("reviewPath"):
+        print(f"  review: {event.get('reviewPath')}")
+    if event.get("promptPath"):
+        print(f"  prompt: {event.get('promptPath')}")
     print("  no queue events, tasks, runs, or coordinator state were changed.")
 
 
@@ -740,6 +943,11 @@ def coordinator_prompt(root: Path, event: dict[str, Any]) -> str:
     return f"""You are the main coordinator in a JSON-first Codex collaboration system.
 
 A worker event needs coordinator attention.
+
+This system is not mainly a parallel-search tool. Its core is persistent worker identity.
+Treat workers as continuing sessions that can be resumed, questioned, retried, or asked for a second pass.
+Your job is to review the handoff, decide whether the same worker should continue, and write the next task state deliberately.
+If the next step is still the same workstream, prefer reusing that worker instead of scattering the topic into new parallel branches.
 
 Read:
 - {root / 'tasks.json'}
@@ -764,23 +972,69 @@ Do not treat this prompt as proof that the task is resolved. The queue runner wi
 """
 
 
+def worker_prompt(root: Path, task: dict[str, Any], run_dir: Path, worker: str) -> str:
+    handoff_path = worker_handoff_path(run_dir)
+    task_snapshot = worker_task_snapshot_path(run_dir)
+    prompt_path = worker_prompt_path(run_dir)
+    return f"""You are {worker} in a JSON-first Codex collaboration system.
+
+You are not a throwaway parallel search branch. You are a persistent worker identity that may be resumed later for follow-up questions or a second pass on the same line of work.
+Preserve continuity in your handoff so the coordinator can send the same workstream back to you if needed.
+
+Read:
+- {prompt_path}
+- {root / 'tasks.json'}
+- {task_snapshot}
+- {root / 'dashboard.md'}
+
+Complete task {task['id']}. Write your final handoff to:
+{handoff_path}
+
+The handoff must include status, summary, changed files, validation commands and results, risks, review notes, and whether a human decision is needed.
+Allowed handoff statuses are: done, blocked, needs-human, failed.
+Do not edit tasks.json or dashboard.md unless the task explicitly asks for coordination-system changes.
+Do not revert unrelated changes made by other workers or the user.
+"""
+
+
+def prepare_worker_artifacts(root: Path, task: dict[str, Any], run_dir: Path, worker: str) -> None:
+    write_json(worker_task_snapshot_path(run_dir), clone_json(task))
+    worker_prompt_path(run_dir).write_text(worker_prompt(root, task, run_dir, worker), encoding="utf-8")
+
+
+def prepare_review_artifacts(root: Path, event: dict[str, Any]) -> tuple[Path, Path, Path, Path]:
+    attach_queue_event_artifact_fields(root, event)
+    artifact_dir = review_dir(root, event)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    event_snapshot = coordinator_event_snapshot_path(root, event)
+    prompt_file = coordinator_prompt_path(root, event)
+    output_last = coordinator_last_message_path(root, event)
+    log_path = coordinator_run_log_path(root, event)
+    write_json(event_snapshot, clone_json(event))
+    prompt_file.write_text(coordinator_prompt(root, event), encoding="utf-8")
+    if not log_path.exists():
+        log_path.write_text("Coordinator review log will appear here.\n", encoding="utf-8")
+    if not output_last.exists():
+        output_last.write_text("Coordinator last message will appear here after a live resume.\n", encoding="utf-8")
+    return event_snapshot, prompt_file, output_last, log_path
+
+
 def run_coordinator_codex(root: Path, event: dict[str, Any], coordinator: dict[str, Any], timeout: int) -> tuple[int, Path]:
     session_id = str(coordinator.get("sessionId", "")).strip()
     if not session_id:
         raise SystemExit("config.json coordinator.sessionId is required for live run-coordinator. Use --dry-run for read-only preview or --exercise-flow for local queue rehearsal.")
-    log_dir = root / "state" / "coordinator-runs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    output_last = log_dir / f"{slugify(event['id'])}-last-message.md"
+    cwd = coordinator_cwd(root, coordinator)
+    _, _, output_last, log_path = prepare_review_artifacts(root, event)
     prompt = coordinator_prompt(root, event)
-    cmd = ["exec", "resume"]
-    cmd += codex_model_args(coordinator)
-    cmd += ["-o", str(output_last), "--skip-git-repo-check", session_id, "-"]
-    log_path = log_dir / f"{slugify(event['id'])}.log"
+    cmd = codex_live_args(coordinator, cwd)
+    cmd += ["exec", "resume", "-o", str(output_last), "--skip-git-repo-check", session_id, "-"]
     return run_codex_cli(cmd, timeout, log_path, prompt=prompt), log_path
 
 
 def process_coordinator_event(root: Path, event: dict[str, Any], coordinator: dict[str, Any], exercise_flow: bool, timeout: int) -> str:
     if exercise_flow:
+        _, _, _, log_path = prepare_review_artifacts(root, event)
+        log_path.write_text(f"Exercise-flow completed for {event['id']}.\n", encoding="utf-8")
         state = "delivered" if event_still_needs_coordinator(root, event) else "resolved"
         update_queue_event(
             root,
@@ -861,6 +1115,10 @@ def validate_data(root: Path, data: dict[str, Any], workers: dict[str, Any]) -> 
             issues.append({"level": "error", "message": f"{task_id}: running task must have currentRunId."})
         if status != "running" and task.get("currentRunId"):
             issues.append({"level": "warning", "message": f"{task_id}: currentRunId is set but status is {status}."})
+        for key in ["promptPath", "taskSnapshotPath", "runLogPath", "lastMessagePath"]:
+            value = task.get(key)
+            if value and not (root / str(value)).exists():
+                issues.append({"level": "warning", "message": f"{task_id}: {key} does not exist: {value}."})
         handoff = task.get("handoffPath")
         if handoff and not (root / handoff).exists():
             issues.append({"level": "warning", "message": f"{task_id}: handoffPath does not exist: {handoff}."})
@@ -881,6 +1139,21 @@ def validate_codex_runtime_config(label: str, config: dict[str, Any]) -> list[di
     if reasoning_effort and reasoning_effort not in REASONING_EFFORT_VALUES:
         allowed = ", ".join(sorted(REASONING_EFFORT_VALUES))
         issues.append({"level": "warning", "message": f"{label}.reasoningEffort is '{reasoning_effort}'. Common values: {allowed}."})
+    sandbox = config.get("sandbox", "")
+    if sandbox is not None and not isinstance(sandbox, str):
+        issues.append({"level": "error", "message": f"{label}.sandbox must be a string."})
+    elif str(sandbox).strip() and str(sandbox).strip() not in SANDBOX_VALUES:
+        allowed = ", ".join(sorted(SANDBOX_VALUES))
+        issues.append({"level": "warning", "message": f"{label}.sandbox is '{sandbox}'. Expected one of: {allowed}."})
+    approval_policy = config.get("approvalPolicy", "")
+    if approval_policy is not None and not isinstance(approval_policy, str):
+        issues.append({"level": "error", "message": f"{label}.approvalPolicy must be a string."})
+    elif str(approval_policy).strip() and str(approval_policy).strip() not in APPROVAL_POLICY_VALUES:
+        allowed = ", ".join(sorted(APPROVAL_POLICY_VALUES))
+        issues.append({"level": "warning", "message": f"{label}.approvalPolicy is '{approval_policy}'. Expected one of: {allowed}."})
+    search = config.get("search", False)
+    if search is not None and not isinstance(search, (bool, str, int)):
+        issues.append({"level": "error", "message": f"{label}.search must be a boolean-like value."})
     return issues
 
 
@@ -924,6 +1197,10 @@ def validate_queue(root: Path, queue: dict[str, Any], tasks_data: dict[str, Any]
         expected_id = queue_event_id(task_id, str(event.get("runId", "")), status)
         if event_id and event_id != expected_id:
             issues.append({"level": "warning", "message": f"{event_id}: expected event id '{expected_id}'."})
+        for key in ["reviewPath", "eventPath", "promptPath", "runLogPath", "lastMessagePath"]:
+            value = str(event.get(key, "")).strip()
+            if value and not (root / value).exists():
+                issues.append({"level": "warning", "message": f"{event_id}: {key} does not exist: {value}."})
         if state in {"pending", "retry", "running"} and not event_matches_current_task_attention(event, task, notify_statuses):
             issues.append({"level": "warning", "message": f"{event_id}: active queue event is stale or superseded; run repair-queue to resolve it."})
         if state == "resolved" and event_matches_current_task_attention(event, task, notify_statuses):
@@ -1039,9 +1316,16 @@ def doctor_issues(root: Path, live: bool) -> list[dict[str, str]]:
     else:
         level = "warning" if not live else "error"
         issues.append({"level": level, "message": "coordinator.sessionId is empty; live run-coordinator cannot resume the main session."})
+    coordinator_root = Path(coordinator_cwd(root, coordinator))
+    level = "ok" if coordinator_root.exists() else "warning"
+    issues.append({"level": level, "message": f"coordinator cwd: {coordinator_root} ({'found' if coordinator_root.exists() else 'missing'})."})
     coordinator_model = str(coordinator.get("model", "")).strip() or "default"
     coordinator_effort = str(coordinator.get("reasoningEffort", "")).strip() or "default"
     issues.append({"level": "ok", "message": f"coordinator model/reasoning: {coordinator_model}/{coordinator_effort}."})
+    coordinator_sandbox = str(coordinator.get("sandbox", "")).strip() or "default"
+    coordinator_approval = str(coordinator.get("approvalPolicy", "")).strip() or "default"
+    coordinator_search = "on" if truthy(coordinator.get("search")) else "off"
+    issues.append({"level": "ok", "message": f"coordinator live runtime: sandbox={coordinator_sandbox}, approval={coordinator_approval}, search={coordinator_search}."})
 
     if not workers:
         issues.append({"level": "error", "message": "No workers are configured in config.json."})
@@ -1057,6 +1341,23 @@ def doctor_issues(root: Path, live: bool) -> list[dict[str, str]]:
         worker_model = str(cfg.get("model", "")).strip() or "default"
         worker_effort = str(cfg.get("reasoningEffort", "")).strip() or "default"
         issues.append({"level": "ok", "message": f"worker {worker} model/reasoning: {worker_model}/{worker_effort}."})
+        worker_sandbox = str(cfg.get("sandbox", "")).strip() or "default"
+        worker_approval = str(cfg.get("approvalPolicy", "")).strip() or "default"
+        worker_search = "on" if truthy(cfg.get("search")) else "off"
+        issues.append({"level": "ok", "message": f"worker {worker} live runtime: sandbox={worker_sandbox}, approval={worker_approval}, search={worker_search}, resume={'on' if truthy(cfg.get('useResume')) else 'off'}."})
+        state_path = root / "state" / f"{worker}.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                issues.append({"level": "warning", "message": f"worker {worker} state file unreadable: {exc}."})
+            else:
+                if state.get("status") == "running":
+                    pid_state = process_exists(state.get("pid"))
+                    if pid_state is False:
+                        issues.append({"level": "warning", "message": f"worker {worker} state says running but pid {state.get('pid')} is not alive; stale recovery or manual move may be needed."})
+                    elif pid_state is True:
+                        issues.append({"level": "ok", "message": f"worker {worker} state says running and pid {state.get('pid')} is alive."})
     return issues
 
 
@@ -1114,6 +1415,8 @@ def command_new_task(args) -> None:
             "currentRunId": "",
             "lastRunId": "",
             "handoffPath": "",
+            "promptPath": "",
+            "taskSnapshotPath": "",
             "runs": [],
             "reviewNotes": "",
         }
@@ -1324,11 +1627,16 @@ def claim_next_task(root: Path, worker: str) -> tuple[dict[str, Any], Path] | tu
                 "status": "running",
                 "startedAt": iso_now(),
                 "path": rel(root, run_dir),
+                "taskSnapshotPath": rel(root, worker_task_snapshot_path(run_dir)),
+                "promptPath": rel(root, worker_prompt_path(run_dir)),
+                "handoffPath": "",
+                "runLogPath": "",
+                "lastMessagePath": rel(root, worker_last_message_path(run_dir)),
             }
         )
         save_tasks(root, data)
         snapshot = json.loads(json.dumps(task))
-    write_json(run_dir / "task.json", snapshot)
+    prepare_worker_artifacts(root, snapshot, run_dir, worker)
     return snapshot, run_dir
 
 
@@ -1370,11 +1678,15 @@ def finish_task(root: Path, task_id: str, run_id: str, exit_code: int, handoff: 
             raise SystemExit(f"Task disappeared while running: {task_id}")
         if task.get("currentRunId") != run_id:
             raise SystemExit(f"Refusing to finish {task_id}: currentRunId changed.")
+        run_dir = root / "runs" / run_id
         task["status"] = status
         task["currentRunId"] = ""
         task["lastRunId"] = run_id
         task["handoffPath"] = rel(root, handoff) if handoff.exists() else ""
+        task["promptPath"] = rel(root, worker_prompt_path(run_dir)) if worker_prompt_path(run_dir).exists() else ""
+        task["taskSnapshotPath"] = rel(root, worker_task_snapshot_path(run_dir)) if worker_task_snapshot_path(run_dir).exists() else ""
         task["runLogPath"] = rel(root, run_log) if run_log.exists() else ""
+        task["lastMessagePath"] = rel(root, worker_last_message_path(run_dir)) if worker_last_message_path(run_dir).exists() else ""
         task["updatedAt"] = iso_now()
         for run in task.get("runs", []):
             if run.get("id") == run_id:
@@ -1382,7 +1694,10 @@ def finish_task(root: Path, task_id: str, run_id: str, exit_code: int, handoff: 
                 run["exitCode"] = exit_code
                 run["finishedAt"] = iso_now()
                 run["handoffPath"] = task["handoffPath"]
+                run["promptPath"] = task["promptPath"]
+                run["taskSnapshotPath"] = task["taskSnapshotPath"]
                 run["runLogPath"] = task["runLogPath"]
+                run["lastMessagePath"] = task["lastMessagePath"]
         completed_task = json.loads(json.dumps(task))
         save_tasks(root, data)
     if completed_task:
@@ -1392,39 +1707,16 @@ def finish_task(root: Path, task_id: str, run_id: str, exit_code: int, handoff: 
 
 def run_codex(root: Path, task: dict[str, Any], run_dir: Path, worker: str, worker_cfg: dict[str, Any], timeout: int) -> int:
     cwd = worker_cwd(root, worker_cfg)
-    handoff_path = run_dir / "handoff.md"
-    output_last = run_dir / "last-message.md"
-    task_snapshot = run_dir / "task.json"
-    prompt = f"""You are {worker} in a JSON-first Codex collaboration system.
-
-Source of truth:
-- {root / 'tasks.json'}
-
-Your assigned task snapshot:
-- {task_snapshot}
-
-Rendered overview, for reading only:
-- {root / 'dashboard.md'}
-
-Complete task {task['id']}. Write your final handoff to:
-{handoff_path}
-
-The handoff must include status, summary, changed files, validation commands and results, risks, review notes, and whether a human decision is needed.
-Allowed handoff statuses are: done, blocked, needs-human, failed.
-Do not edit tasks.json or dashboard.md unless the task explicitly asks for coordination-system changes.
-Do not revert unrelated changes made by other workers or the user.
-"""
-    cmd = ["exec"]
+    handoff_path = worker_handoff_path(run_dir)
+    output_last = worker_last_message_path(run_dir)
+    prompt = worker_prompt(root, task, run_dir, worker)
+    cmd = codex_live_args(worker_cfg, cwd)
+    cmd += ["exec"]
     if worker_cfg.get("useResume") and worker_cfg.get("sessionId"):
-        cmd += ["resume"]
-        cmd += codex_model_args(worker_cfg)
-        cmd += ["-o", str(output_last), "--skip-git-repo-check", worker_cfg["sessionId"], "-"]
+        cmd += ["resume", "-o", str(output_last), "--skip-git-repo-check", worker_cfg["sessionId"], "-"]
     else:
-        cmd += codex_model_args(worker_cfg)
-        if worker_cfg.get("sandbox"):
-            cmd += ["-s", worker_cfg["sandbox"]]
-        cmd += ["-C", cwd, "-o", str(output_last), "--skip-git-repo-check", "-"]
-    exit_code = run_codex_cli(cmd, timeout, run_dir / "run.log", prompt=prompt)
+        cmd += ["-o", str(output_last), "--skip-git-repo-check", "-"]
+    exit_code = run_codex_cli(cmd, timeout, worker_run_log_path(run_dir), prompt=prompt)
     if not handoff_path.exists() and output_last.exists():
         shutil.copyfile(output_last, handoff_path)
     return exit_code
@@ -1580,6 +1872,9 @@ def command_review(args) -> None:
         if task.get("status") not in statuses:
             continue
         print(f"\n[{task['status'].upper()}] {task['id']} - {task.get('title', '')}")
+        prompt_path = root / task.get("promptPath", "")
+        if task.get("promptPath") and prompt_path.exists() and prompt_path.is_file():
+            print(f"Prompt: {prompt_path}")
         handoff = root / task.get("handoffPath", "")
         if handoff.exists() and handoff.is_file():
             print(f"Handoff: {handoff}")
@@ -1679,10 +1974,12 @@ def render_dashboard(root: Path, recent_limit: int) -> str:
     active_events = [event for event in queue.get("events", []) if event.get("state") in QUEUE_ACTIVE_STATES or event.get("state") == "failed"]
     if active_events:
         lines.append("")
-        lines.append("| State | Event | Task | Status | Attempts | Updated |")
-        lines.append("|---|---|---|---|---:|---|")
+        lines.append("| State | Event | Task | Status | Attempts | Review | Prompt | Updated |")
+        lines.append("|---|---|---|---|---:|---|---|---|")
         for event in sorted(active_events, key=lambda item: item.get("updatedAt", item.get("createdAt", "")), reverse=True)[:recent_limit]:
-            lines.append(f"| {escape_cell(event.get('state'))} | {escape_cell(event.get('id'))} | {escape_cell(event.get('taskId'))} | {escape_cell(event.get('status'))} | {escape_cell(event.get('attempts'))} | {escape_cell(event.get('updatedAt'))} |")
+            preview = clone_json(event)
+            attach_queue_event_artifact_fields(root, preview)
+            lines.append(f"| {escape_cell(preview.get('state'))} | {escape_cell(preview.get('id'))} | {escape_cell(preview.get('taskId'))} | {escape_cell(preview.get('status'))} | {escape_cell(preview.get('attempts'))} | {escape_cell(preview.get('reviewPath'))} | {escape_cell(preview.get('promptPath'))} | {escape_cell(preview.get('updatedAt'))} |")
     lines.append("")
     lines.append("## Human Attention Queue")
     lines.append("")
@@ -1729,10 +2026,10 @@ def render_dashboard(root: Path, recent_limit: int) -> str:
     if not review_rows:
         lines.append("No completed handoffs are waiting for review.")
     else:
-        lines.append("| ID | Title | Owner | Handoff |")
-        lines.append("|---|---|---|---|")
+        lines.append("| ID | Title | Owner | Prompt | Handoff |")
+        lines.append("|---|---|---|---|---|")
         for task in review_rows:
-            lines.append(f"| {escape_cell(task.get('id'))} | {escape_cell(task.get('title'))} | {escape_cell(task.get('owner'))} | {escape_cell(task.get('handoffPath'))} |")
+            lines.append(f"| {escape_cell(task.get('id'))} | {escape_cell(task.get('title'))} | {escape_cell(task.get('owner'))} | {escape_cell(task.get('promptPath'))} | {escape_cell(task.get('handoffPath'))} |")
     lines.append("")
     lines.append("## Escalation Conditions")
     lines.append("")
@@ -1824,15 +2121,15 @@ def build_parser() -> argparse.ArgumentParser:
     new_task.add_argument("--owner", default="")
     new_task.add_argument("--assignee", default="", help="Legacy alias for --owner")
     new_task.add_argument("--title", required=True)
-    new_task.add_argument("--goal", default="")
-    new_task.add_argument("--context", default="")
+    new_task.add_argument("--goal", default="", help="One-sentence success condition for the worker")
+    new_task.add_argument("--context", default="", help="Background, key facts, and the first files or folders the worker should read")
     new_task.add_argument("--mode", default="implement")
     new_task.add_argument("--risk", choices=sorted(RISK_VALUES), default="low")
     new_task.add_argument("--status", choices=TASK_STATUSES, default="")
     new_task.add_argument("--requires-human-approval", action="store_true")
-    new_task.add_argument("--boundary", action="append")
-    new_task.add_argument("--deliverable", action="append")
-    new_task.add_argument("--validation", action="append")
+    new_task.add_argument("--boundary", action="append", help="Constraint or non-goal; repeat for multiple boundaries")
+    new_task.add_argument("--deliverable", action="append", help="Expected result or handoff content; repeat for multiple deliverables")
+    new_task.add_argument("--validation", action="append", help="Required check to run, or acceptable explanation if no command can run; repeat for multiple checks")
     new_task.set_defaults(func=command_new_task)
 
     approve = sub.add_parser("approve")
